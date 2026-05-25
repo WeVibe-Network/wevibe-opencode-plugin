@@ -268,6 +268,15 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         deniedCids.add(decision.memoryID)
         reportedCids.delete(decision.memoryID)
         addToBlacklistFile(decision.memoryID)
+
+        if (orgId) {
+          try {
+            await submitDenial(orgId, decision)
+          } catch (err) {
+            logPlugin("error", `denial submission failed: ${err instanceof Error ? err.message : String(err)}`)
+          }
+        }
+
         continue
       }
 
@@ -331,6 +340,36 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     if (!response.ok) {
       const text = await response.text()
       throw new Error(`status=${response.status} body=${text}`)
+    }
+  }
+
+  async function submitDenial(
+    organizationId: string,
+    decision: StoredDecision,
+  ): Promise<void> {
+    const token = readWeVibeMcpToken()
+    if (!token) {
+      logPlugin("error", "no MCP session token — skipping denial submission")
+      return
+    }
+
+    const response = await fetch(`${WEVIBE_MCP_HTTP}/v1/denials`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        org_id: organizationId,
+        memory_hash: decision.memoryID,
+        reason: decision.reason ?? "",
+      }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    })
+
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "")
+      throw new Error(`denial submission failed: ${response.status} ${errText}`)
     }
   }
 
