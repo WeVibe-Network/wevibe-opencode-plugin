@@ -6,6 +6,7 @@ interface CachedMemory {
   text: string
   score: number
   keywords: string[]
+  matchedKeywords: string[]
   flags: string[]
   blocked: boolean
   blockReason: string
@@ -476,7 +477,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         return
       }
 
-      const data = await res.json() as { status?: string; memories?: Array<{ cid: string; text: string; score: number; breakdown?: { keyword_matches?: Array<{ keyword: string }> }; source?: string; memory_type?: string; guard?: { passed: boolean; detections?: Array<{ field: string; scanner: string; rule: string }>; flags?: string[] } }> }
+      const data = await res.json() as { status?: string; memories?: Array<{ cid: string; text: string; score: number; breakdown?: { keyword_matches?: Array<{ keyword: string }> }; matched_keywords?: string[]; source?: string; memory_type?: string; guard?: { passed: boolean; detections?: Array<{ field: string; scanner: string; rule: string }>; flags?: string[] } }> }
       if (data.status !== 'ok' || !data.memories) return
 
       cachedMemories.length = 0
@@ -504,6 +505,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           score: mem.score,
           keywords: mem.breakdown?.keyword_matches?.map(
             (k: { keyword: string }) => k.keyword) ?? [],
+          matchedKeywords: mem.matched_keywords ?? [],
           flags,
           blocked,
           blockReason,
@@ -665,6 +667,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
               org_id: orgId,
               memory_hash: mem.cid,
               nullifier: mem.cid,
+              matched_keywords: mem.matchedKeywords,
             }),
             signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
           }).catch(() => {})
