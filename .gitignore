@@ -1,6 +1,3 @@
-# Worker AI operating context — local only, never committed
-AGENTS.md
-SESSIONCONTINUANCE.md
 
 # OS artifacts
 .DS_Store
@@ -32,3 +29,9 @@ yarn-debug.log*
 wevibe-plugin-queue.json
 wevibe-plugin-decisions.json
 wevibe-plugin-status.json
+
+# Local orchestration docs (never committed)
+AGENTS.md
+MANAGER.md
+WORKER.md
+SESSIONCONTINUANCE.md

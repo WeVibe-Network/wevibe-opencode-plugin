@@ -1,42 +1,92 @@
 # wevibe-opencode-plugin
 
-Part of [WeVibe Network](https://github.com/WeVibe-Network).
+OpenCode plugin integration for WeVibe memory retrieval, review, and injection.
 
-This repository is being initialized as part of Sprint 28. Full
-content lands in subsequent change orders (CO-282 through CO-285).
+## Overview
 
-## Plugin Overview
+`wevibe-opencode-plugin` is a TypeScript plugin package focused on OpenCode.
 
-- `WeVibeMemoryPlugin` is exported from `plugins/wevibe-plugin.ts` and registered with OpenCode via `wevibe-plugin-tui.tsx`.
-- The plugin manages moderation queues backed by `.opencode/wevibe-plugin-queue.json`, `.opencode/wevibe-plugin-decisions.json`, and `.opencode/wevibe-plugin-status.json` inside the active worktree.
-- Errors and warnings are appended to `wevibe-plugin-errors.log` under the detected WeVibe workspace root (or the current working directory).
+Current alpha implementation:
 
-### Serve keyword threading (CO-033b)
+- Exports `WeVibeMemoryPlugin` from `plugins/wevibe-plugin.ts`.
+- Includes a TUI companion in `plugins/wevibe-plugin-tui.tsx` for memory review dialogs.
+- Manages moderation queue/state files in the active worktree under `.opencode/`.
+- Uses the local `wevibe-mcp` loopback API for recall, reports, denials, and serve-event forwarding.
+- Forwards serve events with matched keywords back through MCP/hub reporting paths.
+- Writes operational plugin diagnostics to `wevibe-plugin-errors.log`.
 
-The plugin now carries `matched_keywords` end-to-end on serve reporting:
+## Role in the WeVibe Network
 
-1. Reads `matched_keywords` from hub recall memory results.
-2. Stores them on the in-memory injection records (`toInject`).
-3. Sends them to MCP `POST /v1/serves` with each serve event payload.
+This repository owns the OpenCode integration surface.
 
-This keeps plugin serve reports aligned with the strict hub/chain requirement that `matched_keywords` must be present and non-empty.
+It connects the coding session to local WeVibe controls by:
 
-## Environment
+1. Pulling recalled memory candidates from local `wevibe-mcp`.
+2. Enforcing human review decisions (accept, deny, report) through local moderation queues.
+3. Injecting only approved memory into the agent context.
+4. Sending serve/report/denial events back to MCP and hub services.
 
-- `WEVIBE_HUB_URL` — base URL for the WeVibe Hub; required for filing moderation reports.
-- `WEVIBE_ORG_ID` — organization identifier used when submitting reports to the hub.
-- `WEVIBE_PLUGIN_DEBUG=1` — enables verbose stderr logging with the `wevibe(<level>)` prefix.
-- `WEVIBE_ROOT` — optional override for locating the monorepo when auto-discover fails.
-- `WEVIBE_AUTO_CONTRIBUTE=1` and `WEVIBE_ALLOW_UNREVIEWED=1` are set automatically when the plugin spawns `wevibe-mcp`.
+## Getting started
 
-The plugin also reads `~/.wevibe/plugin-config.json` for the risk appetite (`lowest` or `neutral`) and `~/.wevibe/mcp-session-token` for authenticating with the local MCP service.
+### Prerequisites
 
-## Development
+- Node.js
+- npm
+- OpenCode runtime with plugin loading enabled
+- Local `wevibe-mcp` instance reachable on loopback
 
-- Install dependencies with `npm install`.
-- Type-check with `npm run typecheck` (alias: `npm run build`).
-- The OpenCode package entry point is `plugins/wevibe-plugin.ts`.
+### Build
+
+```bash
+npm install
+npm run build
+```
+
+(`npm run build` and `npm run typecheck` both run `tsc --noEmit`.)
+
+### Run
+
+This package is loaded as an OpenCode plugin rather than run as a standalone daemon.
+
+- Main plugin entry: `plugins/wevibe-plugin.ts`
+- TUI plugin entry: `plugins/wevibe-plugin-tui.tsx`
+
+## Testing
+
+There is no standalone automated test script in this repository yet.
+
+Current validation flow is type-check based:
+
+```bash
+npm run typecheck
+```
+
+## Configuration
+
+Environment variables used by the plugin:
+
+- `WEVIBE_HUB_URL` — hub base URL used for moderation/reporting flows.
+- `WEVIBE_ORG_ID` — org ID for serve/report/denial payloads.
+- `WEVIBE_PLUGIN_DEBUG=1` — enables verbose plugin stderr output.
+- `WEVIBE_ROOT` — optional workspace-root override for locating `wevibe-mcp`.
+
+Local integration assumptions:
+
+- Local MCP HTTP endpoint: `http://127.0.0.1:4450`
+- MCP Bearer token file: `~/.wevibe/mcp-session-token`
+- Local policy config: `~/.wevibe/plugin-config.json`
+- Queue files: `.opencode/wevibe-plugin-queue.json`, `.opencode/wevibe-plugin-decisions.json`, `.opencode/wevibe-plugin-status.json`
+
+## Roadmap
+
+See [ROADMAP.md](./ROADMAP.md).
 
 ## License
 
-Apache-2.0. See LICENSE in the populated version.
+Apache-2.0.
+
+## Links
+
+- Docs: https://github.com/WeVibe-Network/wevibe-docs
+- Org: https://github.com/WeVibe-Network
+- X: https://x.com/WeVibe_Network
