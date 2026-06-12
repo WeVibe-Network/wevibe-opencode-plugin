@@ -419,7 +419,6 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         ...process.env,
         WEVIBE_HUB_URL: process.env.WEVIBE_HUB_URL ?? "http://localhost:4440",
         WEVIBE_AUTO_CONTRIBUTE: "1",
-        WEVIBE_ALLOW_UNREVIEWED: "1",
       }
 
       const child = spawn(process.execPath, [wevibeMcpBin], {
@@ -667,7 +666,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
               org_id: orgId,
               memory_hash: mem.cid,
               nullifier: mem.cid,
-              matched_keywords: mem.matchedKeywords,
+              matched_keywords: mem.matchedKeywords ?? [],
             }),
             signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
           }).catch(() => {})
