@@ -452,6 +452,20 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 }
 
   async function loadMemories(query: string): Promise<void> {
+    let recallOutcomeLogged = false
+    const logRecallOutcome = (
+      status: number | "none",
+      count: number,
+      reasonCode?: string,
+      errorValue?: string,
+    ): void => {
+      if (recallOutcomeLogged) return
+      recallOutcomeLogged = true
+      const reason = typeof reasonCode === "string" && reasonCode.length > 0 ? reasonCode : "none"
+      const error = typeof errorValue === "string" && errorValue.length > 0 ? errorValue : "none"
+      logPlugin("info", `recall: status=${status} count=${count} reason=${reason} error=${error}`)
+    }
+
     try {
       const now = Date.now()
       if (query === memoryCacheKey && cachedMemories.length > 0 && (now - memoryCacheTimestamp) < MEMORY_CACHE_TTL_MS) {
@@ -461,7 +475,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 
       const token = readWeVibeMcpToken()
       if (!token) {
-        logPlugin("warn", "loadMemories: wevibe-mcp token not available")
+        logRecallOutcome("none", 0, "token_missing")
         return
       }
       const res = await fetch(`${WEVIBE_MCP_HTTP}/v1/recall`, {
@@ -472,11 +486,45 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       })
 
       if (!res.ok) {
-        logPlugin("error", `recall request failed: status=${res.status}`)
+        let reasonCode: string | undefined
+        let errorValue: string | undefined
+        try {
+          const payload = JSON.parse(await res.text()) as { reason_code?: unknown; error?: unknown }
+          if (typeof payload.reason_code === "string") {
+            reasonCode = payload.reason_code
+          }
+          if (typeof payload.error === "string") {
+            errorValue = payload.error
+          }
+        } catch {
+          // best-effort payload parsing
+        }
+
+        logRecallOutcome(res.status, 0, reasonCode, errorValue)
         return
       }
 
-      const data = await res.json() as { status?: string; memories?: Array<{ cid: string; text: string; score: number; breakdown?: { keyword_matches?: Array<{ keyword: string }> }; matched_keywords?: string[]; source?: string; memory_type?: string; guard?: { passed: boolean; detections?: Array<{ field: string; scanner: string; rule: string }>; flags?: string[] } }> }
+      const data = await res.json() as {
+        status?: string
+        memories?: Array<{
+          cid: string
+          text: string
+          score: number
+          breakdown?: { keyword_matches?: Array<{ keyword: string }> }
+          matched_keywords?: string[]
+          source?: string
+          memory_type?: string
+          guard?: {
+            passed: boolean
+            detections?: Array<{ field: string; scanner: string; rule: string }>
+            flags?: string[]
+          }
+        }>
+        reason_code?: string
+        error?: string
+      }
+      const memoryCount = Array.isArray(data.memories) ? data.memories.length : 0
+      logRecallOutcome(res.status, memoryCount, data.reason_code, data.error)
       if (data.status !== 'ok' || !data.memories) return
 
       cachedMemories.length = 0
@@ -547,7 +595,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       memoryCacheKey = query
       memoryCacheTimestamp = Date.now()
     } catch (e) {
-      logPlugin("error", `memory load failed: ${e instanceof Error ? e.message : String(e)}`)
+      const errorMessage = e instanceof Error ? e.message : String(e)
+      logRecallOutcome("none", 0, "request_failed", errorMessage)
     }
   }
 
