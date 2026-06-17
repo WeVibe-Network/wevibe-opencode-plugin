@@ -11,7 +11,6 @@
   "main": "plugins/wevibe-plugin.ts",
   "files": [
     "plugins/wevibe-plugin.ts",
-    "plugins/wevibe-plugin-tui.tsx",
     "tui.json",
     "tui"
   ],

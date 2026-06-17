@@ -1,5 +1,6 @@
 import { type Plugin } from "@opencode-ai/plugin"
-import { join, resolve, dirname, homedir } from "path"
+import { join, resolve, dirname } from "path"
+import { homedir } from "os"
 
 interface CachedMemory {
   cid: string
@@ -62,12 +63,16 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   }
 
   const ensureFile = (filePath: string, defaultContents: string): void => {
-    const dir = dirname(filePath)
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true })
-    }
-    if (!existsSync(filePath)) {
-      writeFileSync(filePath, defaultContents)
+    try {
+      const dir = dirname(filePath)
+      if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true })
+      }
+      if (!existsSync(filePath)) {
+        writeFileSync(filePath, defaultContents)
+      }
+    } catch {
+      // best-effort: never let state-file creation crash plugin load
     }
   }
 
@@ -156,20 +161,25 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const resolvedWeVibeRoot = findWeVibeRoot()
   const wevibeRoot = resolvedWeVibeRoot ?? worktree
 
-  const safeWorktree = (typeof worktree === "string" && worktree.length > 0 && existsSync(worktree))
-    ? worktree
-    : undefined
-  const safeDirectory = (typeof directory === "string" && directory.length > 0 && existsSync(directory))
-    ? directory
-    : undefined
-  const errorLogRoot = resolvedWeVibeRoot ?? safeWorktree ?? safeDirectory ?? process.cwd()
+  const isUsableDir = (p: string | undefined | null): p is string =>
+    typeof p === "string" && p.length > 1 && p !== "/" && existsSync(p)
+
+  const safeWorktree = isUsableDir(worktree) ? worktree : undefined
+  const safeDirectory = isUsableDir(directory) ? directory : undefined
+  const safeCwd = isUsableDir(process.cwd()) ? process.cwd() : undefined
+  // Guaranteed-writable fallback when no usable project dir exists at load time
+  // (e.g. the plugin loads at server start with worktree="/"). Prevents
+  // mkdir('/.opencode') EROFS crashes that would fail the whole plugin load.
+  const writableFallback = join(homedir(), ".wevibe")
+  const errorLogRoot = resolvedWeVibeRoot ?? safeWorktree ?? safeDirectory ?? safeCwd ?? writableFallback
   const errorLogPath = join(errorLogRoot, "wevibe-plugin-errors.log")
 
-  const stateRoot = safeWorktree ?? safeDirectory ?? process.cwd()
+  const stateRoot = safeWorktree ?? safeDirectory ?? safeCwd ?? writableFallback
   const stateDir = join(stateRoot, STATE_DIRNAME)
   const queuePath = join(stateDir, QUEUE_FILENAME)
   const decisionPath = join(stateDir, DECISIONS_FILENAME)
   const statusPath = join(stateDir, STATUS_FILENAME)
+  const heartbeatPath = join(stateDir, "wevibe-tui-active.json")
 
   ensureFile(queuePath, "[]\n")
   ensureFile(decisionPath, "[]\n")
@@ -219,6 +229,11 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   }
 
   const readQueue = (): PendingMemory[] => readJson<PendingMemory[]>(queuePath, [])
+
+  const isTuiLive = (): boolean => {
+    const hb = readJson<{ ts?: number }>(heartbeatPath, {})
+    return typeof hb.ts === "number" && (Date.now() - hb.ts) < 30000
+  }
 
   const setQueue = (queue: PendingMemory[]): void => {
     writeJson(queuePath, queue)
@@ -419,6 +434,14 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         ...process.env,
         WEVIBE_HUB_URL: process.env.WEVIBE_HUB_URL ?? "http://localhost:4440",
         WEVIBE_AUTO_CONTRIBUTE: "1",
+        // This background wevibe-mcp instance is spawned detached with stdio:"ignore",
+        // so its stdin is /dev/null. Without WEVIBE_MCP_HTTP_ONLY=1, wevibe-mcp's
+        // stdio transport sees immediate EOF and the daemon shuts itself down, causing
+        // a respawn loop that re-triggers a Touch ID/biometric prompt on every recall
+        // (~every 15s). wevibe-mcp/src/server.ts reads this flag (httpOnly gate) to
+        // keep this HTTP-only daemon alive. Removing it reintroduces the every-15s
+        // fingerprint-prompt regression.
+        WEVIBE_MCP_HTTP_ONLY: "1",
       }
 
       const child = spawn(process.execPath, [wevibeMcpBin], {
@@ -452,6 +475,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 }
 
   async function loadMemories(query: string): Promise<void> {
+    logPlugin("info", `[recall] loadMemories query="${query.slice(0, 80)}"`)
     let recallOutcomeLogged = false
     const logRecallOutcome = (
       status: number | "none",
@@ -469,21 +493,24 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     try {
       const now = Date.now()
       if (query === memoryCacheKey && cachedMemories.length > 0 && (now - memoryCacheTimestamp) < MEMORY_CACHE_TTL_MS) {
-        logPlugin("info", `loadMemories cache hit for "${query.slice(0, 40)}..." (age=${Math.round((now - memoryCacheTimestamp) / 1000)}s)`)
+        logPlugin("info", `[recall] loadMemories cache-hit ageSec=${Math.round((now - memoryCacheTimestamp) / 1000)} query="${query.slice(0, 80)}"`)
         return
       }
 
       const token = readWeVibeMcpToken()
+      logPlugin("info", `[recall] loadMemories tokenPresent=${Boolean(token)}`)
       if (!token) {
         logRecallOutcome("none", 0, "token_missing")
         return
       }
+      logPlugin("info", "[recall] loadMemories request=POST /v1/recall limit=10")
       const res = await fetch(`${WEVIBE_MCP_HTTP}/v1/recall`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
         body: JSON.stringify({ query, limit: 10 }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       })
+      logPlugin("info", `[recall] loadMemories response status=${res.status}`)
 
       if (!res.ok) {
         let reasonCode: string | undefined
@@ -633,6 +660,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const validContextParts = contextParts.filter(p => p && p.trim().length > 0)
   const queryToUse = validContextParts.length > 0 ? validContextParts.join(" ") : "project coding standards conventions best practices"
   const wevibeAvailable = await ensureWeVibeMcpRunning()
+  logPlugin("info", `[recall] init worktree=${worktree} dir=${directory} contextParts=${validContextParts.length} query="${queryToUse.slice(0,80)}"`)
+  logPlugin("info", `[recall] init wevibeAvailable=${wevibeAvailable}`)
   if (wevibeAvailable) {
     await loadMemories(queryToUse)
   }
@@ -658,8 +687,26 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 
     "experimental.chat.system.transform": async (input, output) => {
       await drainDecisions()
+      const tuiLiveForLog = isTuiLive()
+      logPlugin("info", `[recall] transform tuiLive=${tuiLiveForLog} cached=${cachedMemories.length} approved=${approvedCids.size}`)
 
       const appetite = getRiskAppetite()
+      if (!isTuiLive()) {
+        // Headless / no interactive TUI: no popup can appear, so auto-accept the
+        // safe majority (guard-clean, not previously denied/reported, risk-respecting)
+        // so recall actually injects. Mirrors D-11.5 [No gated approval] / gated-on-risk.
+        let autoAcceptedCount = 0
+        for (const m of cachedMemories) {
+          if (m.blocked) continue
+          if (deniedCids.has(m.cid) || reportedCids.has(m.cid)) continue
+          if (appetite === "lowest" && m.memoryType !== "negative_signal") continue
+          if (!approvedCids.has(m.cid)) {
+            autoAcceptedCount += 1
+          }
+          approvedCids.add(m.cid)
+        }
+        logPlugin("info", `[recall] headless auto-accept: approved ${autoAcceptedCount} of ${cachedMemories.length}`)
+      }
       if (appetite === "lowest") {
         logPlugin("info", "risk appetite set to lowest — filtering to negative_signal only")
       }
@@ -668,7 +715,10 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         if (appetite === "lowest" && m.memoryType !== "negative_signal") return false
         return true
       })
-      if (eligible.length === 0) return
+      if (eligible.length === 0) {
+        logPlugin("info", "[recall] nothing to inject (eligible=0)")
+        return
+      }
 
       let matched = eligible
       if (lastPrompt.length > 0) {
@@ -685,7 +735,11 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       }
 
       const toInject = matched.slice(0, 5)
-      if (toInject.length === 0) return
+      if (toInject.length === 0) {
+        logPlugin("info", "[recall] nothing to inject (eligible=0)")
+        return
+      }
+      logPlugin("info", `[recall] injecting ${toInject.length} memories`)
 
       const memoryBlock = [
         "",
