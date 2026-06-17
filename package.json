@@ -22,6 +22,7 @@
     "@opencode-ai/plugin": "1.4.10"
   },
   "devDependencies": {
+    "@types/node": "22.19.21",
     "typescript": "6.0.3"
   }
 }

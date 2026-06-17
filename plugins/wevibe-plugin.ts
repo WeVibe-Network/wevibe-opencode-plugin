@@ -414,7 +414,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 
   async function ensureWeVibeMcpRunning(): Promise<boolean> {
     const token = readWeVibeMcpToken()
-    const headers = token ? { 'Authorization': `Bearer ${token}` } : {}
+    const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {}
     try {
       const healthRes = await fetch(`${WEVIBE_MCP_HTTP}/v1/health`, { headers, signal: AbortSignal.timeout(2000) })
       if (healthRes.ok) return true
@@ -433,6 +433,16 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       const env = {
         ...process.env,
         WEVIBE_HUB_URL: process.env.WEVIBE_HUB_URL ?? "http://localhost:4440",
+        // The spawned MCP performs leader-side Umbral crypto (org-setup epoch-keypair
+        // derivation, kfrag minting, recall decrypt-reencrypted) and guard scanning.
+        // Those shell out to native binaries via WEVIBE_UMBRAL_SIDECAR_BIN / WEVIBE_GUARD_BIN.
+        // opencode's own env does NOT carry these, and the opencode.json mcp.env block does
+        // not apply to a plugin spawn() — so resolve them from wevibeRoot here, or the MCP
+        // throws "failed to derive epoch Umbral public key locally" on org creation.
+        WEVIBE_UMBRAL_SIDECAR_BIN:
+          process.env.WEVIBE_UMBRAL_SIDECAR_BIN ?? join(wevibeRoot, "wevibe-umbral/target/release/wevibe-umbral"),
+        WEVIBE_GUARD_BIN:
+          process.env.WEVIBE_GUARD_BIN ?? join(wevibeRoot, "wevibe-guard/target/release/wevibe-guard"),
         WEVIBE_AUTO_CONTRIBUTE: "1",
         // This background wevibe-mcp instance is spawned detached with stdio:"ignore",
         // so its stdin is /dev/null. Without WEVIBE_MCP_HTTP_ONLY=1, wevibe-mcp's
@@ -454,7 +464,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       for (let attempt = 0; attempt < 10; attempt++) {
         await new Promise(resolve => setTimeout(resolve, 500))
         const retryToken = readWeVibeMcpToken()
-        const retryHeaders = retryToken ? { 'Authorization': `Bearer ${retryToken}` } : {}
+        const retryHeaders: Record<string, string> = retryToken ? { Authorization: `Bearer ${retryToken}` } : {}
         try {
           const res = await fetch(`${WEVIBE_MCP_HTTP}/v1/health`, { headers: retryHeaders, signal: AbortSignal.timeout(1000) })
           if (res.ok) {
@@ -676,10 +686,10 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     },
 
     "chat.message": async (input, output) => {
-      if (input.parts) {
-        for (const part of input.parts as Array<{ type: string; content?: string; text?: string }>) {
+      if (output.parts) {
+        for (const part of output.parts) {
           if (part.type === "text") {
-            lastPrompt = (part.content ?? part.text ?? "").toLowerCase()
+            lastPrompt = (part.text ?? "").toLowerCase()
           }
         }
       }
