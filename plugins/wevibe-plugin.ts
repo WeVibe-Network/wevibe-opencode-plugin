@@ -1,6 +1,7 @@
 import { type Plugin } from "@opencode-ai/plugin"
 import { join, resolve, dirname } from "path"
 import { homedir } from "os"
+import { fileURLToPath } from "node:url"
 
 interface CachedMemory {
   cid: string
@@ -37,8 +38,8 @@ interface StoredStatus {
 }
 
 export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, $ }) => {
-  const fs = await import("fs")
-  const { existsSync, appendFileSync, readFileSync, writeFileSync, mkdirSync } = fs
+  const fs = await import("node:fs")
+  const { existsSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, statSync } = fs
 
   const STATE_DIRNAME = ".opencode"
   const QUEUE_FILENAME = "wevibe-plugin-queue.json"
@@ -127,6 +128,21 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       }
     }
 
+    const pushWithParents = (value: string | undefined | null, maxDepth = 6) => {
+      if (!value) return
+      try {
+        let current = resolve(value)
+        for (let depth = 0; depth <= maxDepth; depth++) {
+          candidates.add(current)
+          const parent = dirname(current)
+          if (parent === current) break
+          current = parent
+        }
+      } catch {
+        // ignore invalid paths
+      }
+    }
+
     push(process.env.WEVIBE_ROOT ?? undefined)
     push(worktree)
     push(join(worktree, "WeVibe"))
@@ -135,6 +151,12 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     push(join(directory, "..", ".."))
     push(process.cwd())
     push(join(process.cwd(), "WeVibe"))
+    try {
+      const pluginFile = fileURLToPath(import.meta.url)
+      pushWithParents(dirname(pluginFile))
+    } catch {
+      // best-effort plugin self-location
+    }
 
     const candidatesArray = Array.from(candidates)
     for (const candidate of candidatesArray) {
@@ -392,6 +414,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const cachedMemories: CachedMemory[] = []
   const contextPaths: Set<string> = new Set()
   let lastPrompt = ""
+  let lastRecalledQuery = ""
   let memoryCacheKey = ""
   let memoryCacheTimestamp = 0
   const MEMORY_CACHE_TTL_MS = 5 * 60 * 1000  // 5 minutes
@@ -417,7 +440,57 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {}
     try {
       const healthRes = await fetch(`${WEVIBE_MCP_HTTP}/v1/health`, { headers, signal: AbortSignal.timeout(2000) })
-      if (healthRes.ok) return true
+      if (healthRes.ok) {
+        let buildStamp = Number.NaN
+        try {
+          const healthBody = await healthRes.json() as { build_stamp?: unknown }
+          buildStamp = typeof healthBody.build_stamp === "number" ? healthBody.build_stamp : Number.NaN
+        } catch {
+          return true
+        }
+
+        if (!Number.isFinite(buildStamp)) {
+          return true
+        }
+
+        const distFile = join(wevibeRoot, "wevibe-mcp/dist/http-server.js")
+        let onDiskMtime = Number.NaN
+        try {
+          onDiskMtime = statSync(distFile).mtimeMs
+        } catch {
+          return true
+        }
+
+        if (onDiskMtime - buildStamp <= 1000) {
+          return true
+        }
+
+        logPlugin("info", "restarting stale-dist wevibe-mcp daemon")
+        try {
+          await fetch(`${WEVIBE_MCP_HTTP}/v1/shutdown`, {
+            method: "POST",
+            headers,
+            signal: AbortSignal.timeout(2000),
+          })
+        } catch {
+          // best-effort shutdown before auto-start
+        }
+
+        for (let attempt = 0; attempt < 10; attempt++) {
+          await new Promise(resolve => setTimeout(resolve, 200))
+          try {
+            const shutdownRes = await fetch(`${WEVIBE_MCP_HTTP}/v1/health`, {
+              headers,
+              signal: AbortSignal.timeout(500),
+            })
+            if (!shutdownRes.ok) {
+              break
+            }
+          } catch {
+            break
+          }
+        }
+      }
     } catch {
       // not running — attempt auto-start
     }
@@ -681,6 +754,31 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     await loadMemories(queryToUse)
   }
 
+  const collectTextParts = (parts: unknown): string => {
+    if (!Array.isArray(parts)) {
+      return ""
+    }
+
+    const textParts: string[] = []
+    for (const part of parts) {
+      if (!part || typeof part !== "object") {
+        continue
+      }
+
+      const candidate = part as { type?: unknown; text?: unknown }
+      if (candidate.type !== "text" || typeof candidate.text !== "string") {
+        continue
+      }
+
+      const text = candidate.text.trim()
+      if (text.length > 0) {
+        textParts.push(text)
+      }
+    }
+
+    return textParts.join("\n").trim()
+  }
+
   return {
     "tool.execute.before": async (input, output) => {
       const args = output.args as Record<string, unknown>
@@ -690,14 +788,23 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       }
     },
 
-    "chat.message": async (input, output) => {
-      if (output.parts) {
-        for (const part of output.parts) {
-          if (part.type === "text") {
-            lastPrompt = (part.text ?? "").toLowerCase()
-          }
-        }
+    "chat.message": async (_input, output) => {
+      // opencode's chat.message API: `input` has NO parts; `output` = { message: UserMessage, parts: Part[] }.
+      // The user's prompt text lives in output.parts (verified against @opencode-ai/plugin index.d.ts:183-195).
+      const userPromptText = collectTextParts((output as { parts?: unknown }).parts)
+      const normalizedPromptText = userPromptText.replace(/\s+/g, " ").trim()
+      lastPrompt = normalizedPromptText.toLowerCase()
+
+      if (!wevibeAvailable || normalizedPromptText.length === 0) {
+        return
       }
+
+      if (normalizedPromptText === lastRecalledQuery) {
+        return
+      }
+
+      await loadMemories(normalizedPromptText)
+      lastRecalledQuery = normalizedPromptText
     },
 
     "experimental.chat.system.transform": async (input, output) => {
