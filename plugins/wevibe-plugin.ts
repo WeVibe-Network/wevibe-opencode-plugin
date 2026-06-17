@@ -454,7 +454,12 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         WEVIBE_MCP_HTTP_ONLY: "1",
       }
 
-      const child = spawn(process.execPath, [wevibeMcpBin], {
+      // opencode ships as a Bun-compiled binary, so process.execPath is the
+      // opencode executable, NOT node — spawning it cannot run dist/server.js.
+      // Use a real node: process.execPath when it is node, else "node" resolved
+      // via PATH (the spawn env below inherits process.env.PATH).
+      const nodeBin = /[\\/]node$/.test(process.execPath) ? process.execPath : "node"
+      const child = spawn(nodeBin, [wevibeMcpBin], {
         detached: true,
         stdio: "ignore",
         env,
