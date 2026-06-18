@@ -250,6 +250,10 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     }
   }
 
+  const logDebug = (message: string): void => {
+    if (process.env.WEVIBE_PLUGIN_DEBUG === "1") logPlugin("info", message)
+  }
+
   const readQueue = (): PendingMemory[] => readJson<PendingMemory[]>(queuePath, [])
 
   const isTuiLive = (): boolean => {
@@ -308,11 +312,9 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         addToBlacklistFile(decision.memoryID)
 
         if (orgId) {
-          try {
-            await submitDenial(orgId, decision)
-          } catch (err) {
+          void submitDenial(orgId, decision).catch(err => {
             logPlugin("error", `denial submission failed: ${err instanceof Error ? err.message : String(err)}`)
-          }
+          })
         }
 
         continue
@@ -328,11 +330,9 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           continue
         }
 
-        try {
-          await submitReport(orgId, decision, entry)
-        } catch (err) {
+        void submitReport(orgId, decision, entry).catch(err => {
           logPlugin("error", `report submission failed: ${err instanceof Error ? err.message : String(err)}`)
-        }
+        })
       }
     }
 
@@ -415,6 +415,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const contextPaths: Set<string> = new Set()
   let lastPrompt = ""
   let lastRecalledQuery = ""
+  let wevibeAvailable = false
   let memoryCacheKey = ""
   let memoryCacheTimestamp = 0
   const MEMORY_CACHE_TTL_MS = 5 * 60 * 1000  // 5 minutes
@@ -715,6 +716,13 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     }
   }
 
+  let recallInFlight: Promise<void> | null = null
+  const triggerRecall = (query: string): void => {
+    if (!wevibeAvailable) return
+    if (recallInFlight) return
+    recallInFlight = loadMemories(query).catch(() => undefined).finally(() => { recallInFlight = null })
+  }
+
   const contextParts: string[] = []
   const isValidWorktree = typeof worktree === "string" && worktree.length > 1 && worktree !== "/" && existsSync(worktree)
   try {
@@ -747,12 +755,18 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 
   const validContextParts = contextParts.filter(p => p && p.trim().length > 0)
   const queryToUse = validContextParts.length > 0 ? validContextParts.join(" ") : "project coding standards conventions best practices"
-  const wevibeAvailable = await ensureWeVibeMcpRunning()
-  logPlugin("info", `[recall] init worktree=${worktree} dir=${directory} contextParts=${validContextParts.length} query="${queryToUse.slice(0,80)}"`)
-  logPlugin("info", `[recall] init wevibeAvailable=${wevibeAvailable}`)
-  if (wevibeAvailable) {
-    await loadMemories(queryToUse)
-  }
+  void (async () => {
+    try {
+      wevibeAvailable = await ensureWeVibeMcpRunning()
+      logPlugin("info", `[recall] init worktree=${worktree} dir=${directory} contextParts=${validContextParts.length} query="${queryToUse.slice(0,80)}"`)
+      logPlugin("info", `[recall] init wevibeAvailable=${wevibeAvailable}`)
+      if (wevibeAvailable) {
+        await loadMemories(queryToUse)
+      }
+    } catch (e) {
+      logPlugin("error", `[recall] background init failed: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  })()
 
   const collectTextParts = (parts: unknown): string => {
     if (!Array.isArray(parts)) {
@@ -795,7 +809,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       const normalizedPromptText = userPromptText.replace(/\s+/g, " ").trim()
       lastPrompt = normalizedPromptText.toLowerCase()
 
-      if (!wevibeAvailable || normalizedPromptText.length === 0) {
+      if (normalizedPromptText.length === 0) {
         return
       }
 
@@ -803,14 +817,18 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         return
       }
 
-      await loadMemories(normalizedPromptText)
+      if (!wevibeAvailable) {
+        return
+      }
+
       lastRecalledQuery = normalizedPromptText
+      triggerRecall(normalizedPromptText)
     },
 
     "experimental.chat.system.transform": async (input, output) => {
       await drainDecisions()
       const tuiLiveForLog = isTuiLive()
-      logPlugin("info", `[recall] transform tuiLive=${tuiLiveForLog} cached=${cachedMemories.length} approved=${approvedCids.size}`)
+      logDebug(`[recall] transform tuiLive=${tuiLiveForLog} cached=${cachedMemories.length} approved=${approvedCids.size}`)
 
       const appetite = getRiskAppetite()
       if (!isTuiLive()) {
@@ -827,10 +845,10 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           }
           approvedCids.add(m.cid)
         }
-        logPlugin("info", `[recall] headless auto-accept: approved ${autoAcceptedCount} of ${cachedMemories.length}`)
+        logDebug(`[recall] headless auto-accept: approved ${autoAcceptedCount} of ${cachedMemories.length}`)
       }
       if (appetite === "lowest") {
-        logPlugin("info", "risk appetite set to lowest — filtering to negative_signal only")
+        logDebug("risk appetite set to lowest — filtering to negative_signal only")
       }
       const eligible = cachedMemories.filter(m => {
         if (m.blocked || !approvedCids.has(m.cid)) return false
@@ -838,7 +856,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         return true
       })
       if (eligible.length === 0) {
-        logPlugin("info", "[recall] nothing to inject (eligible=0)")
+        logDebug("[recall] nothing to inject (eligible=0)")
         return
       }
 
@@ -858,10 +876,10 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 
       const toInject = matched.slice(0, 5)
       if (toInject.length === 0) {
-        logPlugin("info", "[recall] nothing to inject (eligible=0)")
+        logDebug("[recall] nothing to inject (eligible=0)")
         return
       }
-      logPlugin("info", `[recall] injecting ${toInject.length} memories`)
+      logDebug(`[recall] injecting ${toInject.length} memories`)
 
       const memoryBlock = [
         "",
