@@ -193,7 +193,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   // (e.g. the plugin loads at server start with worktree="/"). Prevents
   // mkdir('/.opencode') EROFS crashes that would fail the whole plugin load.
   const writableFallback = join(homedir(), ".wevibe")
-  const errorLogRoot = resolvedWeVibeRoot ?? safeWorktree ?? safeDirectory ?? safeCwd ?? writableFallback
+  const errorLogRoot = safeWorktree ?? safeDirectory ?? safeCwd ?? resolvedWeVibeRoot ?? writableFallback
   const errorLogPath = join(errorLogRoot, "wevibe-plugin-errors.log")
 
   const stateRoot = safeWorktree ?? safeDirectory ?? safeCwd ?? writableFallback
