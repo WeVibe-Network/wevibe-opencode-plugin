@@ -39,6 +39,7 @@ type QueueEntry = {
   text: string;
   source: string;
   createdAt: number;
+  [key: string]: unknown;
 };
 
 type ReportReason = "inappropriate" | "inaccurate" | "security" | "policy" | "other";
@@ -49,6 +50,115 @@ type QueueDecision = {
   reason?: ReportReason;
   note?: string;
   timestamp: number;
+};
+
+type RiskColor = "red" | "amber" | "green";
+
+// Conservative midpoint: anything below this on trust/confidence is caution.
+const LOW_SIGNAL_THRESHOLD = 0.5;
+
+const RISK_BADGE_BY_COLOR: Record<RiskColor, string> = {
+  red: "🔴",
+  amber: "🟡",
+  green: "🟢",
+};
+
+const asRecord = (value: unknown): Record<string, unknown> | null => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+};
+
+const hasArraySignal = (value: unknown): boolean => Array.isArray(value) && value.length > 0;
+
+const normalizeSignal = (value: unknown): number | null => {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
+  if (value <= 1) return value;
+  if (value <= 10) return value / 10;
+  if (value <= 100) return value / 100;
+  return null;
+};
+
+const firstSignal = (...candidates: unknown[]): number | null => {
+  for (const candidate of candidates) {
+    const normalized = normalizeSignal(candidate);
+    if (normalized !== null) return normalized;
+  }
+  return null;
+};
+
+const riskColorForEntry = (entry: QueueEntry): RiskColor => {
+  const guard = asRecord(entry.guard);
+  const contributor = asRecord(entry.contributor);
+
+  if (
+    entry.blocked === true ||
+    entry.guardBlocked === true ||
+    entry.isBlocked === true ||
+    guard?.blocked === true ||
+    guard?.flagged === true ||
+    guard?.passed === false
+  ) {
+    return "red";
+  }
+
+  const stateSignals = [entry.state, entry.status, entry.riskState, guard?.state, guard?.status, guard?.result];
+  if (
+    stateSignals.some(
+      (value) => typeof value === "string" && /(blocked|danger|dangerous|flagged|denied?|fail(?:ed)?|unsafe|malicious)/i.test(value),
+    )
+  ) {
+    return "red";
+  }
+
+  if (
+    hasArraySignal(entry.flags) ||
+    hasArraySignal(entry.guardFlags) ||
+    hasArraySignal(entry.guard_flags) ||
+    hasArraySignal(guard?.flags) ||
+    hasArraySignal(guard?.detections)
+  ) {
+    return "red";
+  }
+
+  const trustedSignals = [
+    entry.trustedContributor,
+    entry.trusted_contributor,
+    entry.isTrustedContributor,
+    entry.isTrusted,
+    contributor?.trusted,
+    contributor?.isTrusted,
+  ];
+  if (trustedSignals.some((value) => value === false)) {
+    return "amber";
+  }
+
+  const trustSignal = firstSignal(
+    entry.trust,
+    entry.trustScore,
+    entry.trust_score,
+    entry.contributorTrust,
+    entry.contributor_trust,
+    contributor?.trust,
+    contributor?.trustScore,
+    contributor?.trust_score,
+  );
+  const confidenceSignal = firstSignal(
+    entry.confidence,
+    entry.confidenceScore,
+    entry.confidence_score,
+    entry.score,
+    entry.recallScore,
+    entry.recall_score,
+  );
+
+  if (
+    (trustSignal !== null && trustSignal < LOW_SIGNAL_THRESHOLD) ||
+    (confidenceSignal !== null && confidenceSignal < LOW_SIGNAL_THRESHOLD)
+  ) {
+    return "amber";
+  }
+
+  return "green";
 };
 
 const THRESHOLD = 3;
@@ -407,11 +517,15 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
   };
 
   const showReviewDialog = (entry: QueueEntry) => {
+    const riskColor = riskColorForEntry(entry);
+    const riskBadge = RISK_BADGE_BY_COLOR[riskColor];
     openReviewDialog(
       () =>
         api.ui.DialogSelect({
-          title: "WeVibe — Review Memory",
-          placeholder: `Source: ${entry.source}\n\n"${truncate(entry.text, 200)}"`,
+          // DialogSelect does not expose a border-color prop in the plugin API,
+          // so show a color-coded badge in the title as the top-of-popup cue.
+          title: `${riskBadge} WeVibe — Review Memory`,
+          placeholder: `Memory\n\n"${truncate(entry.text, 600)}"\n\nref: ${entry.cid.slice(0, 8)}`,
           options: [
             { title: "Accept — inject into session", value: "accept" as const },
             { title: "Deny — discard", value: "deny" as const },
@@ -421,14 +535,7 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
           onSelect: (option: { value: "accept" | "deny" | "report" | "risk" }) => {
             const action = option?.value;
             if (action === "accept") {
-              recordDecision({ memoryID: entry.id, action: "accept", timestamp: Date.now() });
-              toast("success", "Memory accepted");
-              try {
-                api.ui.dialog.clear();
-              } catch {
-                /* ignore */
-              }
-              queueAdvance();
+              showAcceptConfirm(entry);
             } else if (action === "deny") {
               showDenyConfirm(entry);
             } else if (action === "report") {
@@ -449,62 +556,109 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
     );
   };
 
-  const showDenyConfirm = (entry: QueueEntry) => {
+  const showReviewActionConfirm = (
+    entry: QueueEntry,
+    config: {
+      title: string;
+      explainer: string;
+      confirmTitle: string;
+      onConfirm: () => void;
+    },
+  ) => {
+    let handled = false;
     openReviewDialog(
       () =>
-        api.ui.DialogConfirm({
-          title: "Deny this memory?",
-          message: "This memory will be discarded.",
-          onConfirm: () => {
-            recordDecision({ memoryID: entry.id, action: "deny", timestamp: Date.now() });
-            toast("info", "Memory denied");
-            try {
-              api.ui.dialog.clear();
-            } catch {
-              /* ignore */
+        api.ui.DialogSelect({
+          title: config.title,
+          placeholder: config.explainer,
+          options: [
+            { title: config.confirmTitle, value: "confirm" as const },
+            { title: "Back", value: "back" as const },
+          ],
+          onSelect: (option: { value: "confirm" | "back" }) => {
+            const selection = option?.value;
+            handled = true;
+            if (selection === "confirm") {
+              config.onConfirm();
+            } else {
+              showReviewDialog(entry);
             }
-            queueAdvance();
           },
-          onCancel: () => showReviewDialog(entry),
         }),
       () => {
-        activeMemoryId = null;
+        if (!handled) {
+          showReviewDialog(entry);
+        }
       },
     );
   };
 
+  const showAcceptConfirm = (entry: QueueEntry) => {
+    showReviewActionConfirm(entry, {
+      title: "Accept this memory?",
+      explainer:
+        "Inject this memory into the agent's context now.\nA serve will be recorded to signal this memory was useful.",
+      confirmTitle: "Confirm Accept",
+      onConfirm: () => {
+        recordDecision({ memoryID: entry.id, action: "accept", timestamp: Date.now() });
+        toast("success", "Memory accepted");
+        try {
+          api.ui.dialog.clear();
+        } catch {
+          /* ignore */
+        }
+        queueAdvance();
+      },
+    });
+  };
+
+  const showDenyConfirm = (entry: QueueEntry) => {
+    showReviewActionConfirm(entry, {
+      title: "Deny this memory?",
+      explainer: "Discard this memory from this review queue.\nA denial decision will be recorded.",
+      confirmTitle: "Confirm Deny",
+      onConfirm: () => {
+        recordDecision({ memoryID: entry.id, action: "deny", timestamp: Date.now() });
+        toast("info", "Memory denied");
+        try {
+          api.ui.dialog.clear();
+        } catch {
+          /* ignore */
+        }
+        queueAdvance();
+      },
+    });
+  };
+
   const showReportConfirm = (entry: QueueEntry, reason: ReportReason, noteInput?: string) => {
     const note = typeof noteInput === "string" ? noteInput.trim() : "";
-    openReviewDialog(
-      () =>
-        api.ui.DialogConfirm({
-          title: "Report this memory?",
-          message: `Reason: ${reason}${note ? `\nNote: ${note}` : ""}\n\nThis will flag and discard this memory.`,
-          onConfirm: () => {
-            const decision: QueueDecision = {
-              memoryID: entry.id,
-              action: "report",
-              reason,
-              timestamp: Date.now(),
-            };
-            if (note.length > 0) {
-              decision.note = note;
-            }
-            recordDecision(decision);
-            toast("warning", "Memory reported");
-            try {
-              api.ui.dialog.clear();
-            } catch {
-              /* ignore */
-            }
-            queueAdvance();
-          },
-          onCancel: () => showReviewDialog(entry),
-        }),
-      () => {
-        activeMemoryId = null;
+    showReviewActionConfirm(entry, {
+      title: "Report this memory?",
+      explainer:
+        `Reason: ${reason}${note ? `\nNote: ${note}` : ""}\n\n` +
+        "Flag this memory with the selected reason and discard it from this review.\n" +
+        "The report decision will be recorded.",
+      confirmTitle: "Confirm Report",
+      onConfirm: () => {
+        const decision: QueueDecision = {
+          memoryID: entry.id,
+          action: "report",
+          reason,
+          timestamp: Date.now(),
+        };
+        if (note.length > 0) {
+          decision.note = note;
+        }
+        recordDecision(decision);
+        toast("warning", "Memory reported");
+        try {
+          api.ui.dialog.clear();
+        } catch {
+          /* ignore */
+        }
+        queueAdvance();
       },
-    );
+    });
   };
 
   const showReportNotePrompt = (entry: QueueEntry, reason: ReportReason) => {
