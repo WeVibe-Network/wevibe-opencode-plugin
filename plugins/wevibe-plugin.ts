@@ -40,6 +40,8 @@ interface StoredStatus {
 export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, $ }) => {
   const fs = await import("node:fs")
   const { existsSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, statSync } = fs
+  const { randomBytes } = await import("node:crypto")
+  const sessionId = randomBytes(20).toString("hex")
 
   const STATE_DIRNAME = ".opencode"
   const QUEUE_FILENAME = "wevibe-plugin-queue.json"
@@ -211,6 +213,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const deniedCids = new Set<string>()
   const reportedCids = new Set<string>()
   const pendingCids = new Set<string>()
+  const servedInSession = new Set<string>()
 
   const statusSnapshot = readJson<StoredStatus>(statusPath, {
     accepted: [],
@@ -596,7 +599,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       const res = await fetch(`${WEVIBE_MCP_HTTP}/v1/recall`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ query, limit: 10 }),
+        body: JSON.stringify({ query, limit: 10, session_id: sessionId }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       })
       logPlugin("info", `[recall] loadMemories response status=${res.status}`)
@@ -871,10 +874,10 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         const withHits = scored.filter(s => s.hits > 0).sort((a, b) => b.hits - a.hits)
         matched = withHits.length > 0
           ? withHits.map(s => s.memory)
-          : eligible.slice(0, 3)
+          : eligible
       }
 
-      const toInject = matched.slice(0, 5)
+      const toInject = matched
       if (toInject.length === 0) {
         logDebug("[recall] nothing to inject (eligible=0)")
         return
@@ -897,8 +900,10 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       output.system.push(memoryBlock)
 
       for (const mem of toInject) {
+        if (servedInSession.has(mem.cid)) continue
         const token = readWeVibeMcpToken()
         if (token && orgId) {
+          servedInSession.add(mem.cid)
           fetch(`${WEVIBE_MCP_HTTP}/v1/serves`, {
             method: "POST",
             headers: {
@@ -910,6 +915,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
               memory_hash: mem.cid,
               nullifier: mem.cid,
               matched_keywords: mem.matchedKeywords ?? [],
+              session_id: sessionId,
             }),
             signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
           }).catch(() => {})
@@ -922,7 +928,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       if (eligible.length > 0) {
         output.context.push(
           "## WeVibe Memories (preserve across compaction)\n" +
-          eligible.slice(0, 5).map(m => `- ${m.text}`).join("\n")
+          eligible.map(m => `- ${m.text}`).join("\n")
         )
       }
     },
