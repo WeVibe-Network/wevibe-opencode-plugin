@@ -9,20 +9,27 @@
   },
   "license": "Apache-2.0",
   "main": "plugins/wevibe-plugin.ts",
+  "bin": {
+    "wevibe-install-opencode": "bin/install-opencode.ts"
+  },
   "files": [
+    "bin",
     "plugins/wevibe-plugin.ts",
     "tui.json",
     "tui"
   ],
   "scripts": {
     "build": "tsc --noEmit",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "install-opencode": "tsx bin/install-opencode.ts install-opencode",
+    "uninstall-opencode": "tsx bin/install-opencode.ts uninstall-opencode"
   },
   "dependencies": {
     "@opencode-ai/plugin": "1.4.10"
   },
   "devDependencies": {
     "@types/node": "22.19.21",
+    "tsx": "^4.19.2",
     "typescript": "6.0.3"
   }
 }

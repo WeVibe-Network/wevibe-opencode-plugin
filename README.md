@@ -1,104 +1,64 @@
-<div align="center">
+# wevibe-opencode-plugin
 
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:02100a,100:2fe07a&height=160&section=header&text=wevibe-opencode-plugin&fontColor=54f59a&fontSize=42&fontAlignY=40&desc=OpenCode%20integration%20for%20WeVibe%20memory&descAlignY=64&descSize=16" alt="wevibe-opencode-plugin" width="100%" />
+Self-contained OpenCode plugin package for WeVibe integration.
 
-![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white)
-[![status-alpha](https://img.shields.io/badge/status-alpha-ffc266?style=flat-square)](https://github.com/WeVibe-Network)
-[![license-Apache--2.0](https://img.shields.io/badge/license-Apache--2.0-82aaff?style=flat-square)](LICENSE)
-[![docs-wevibe-docs](https://img.shields.io/badge/docs-wevibe--docs-54f59a?style=flat-square)](https://github.com/WeVibe-Network/wevibe-docs)
-[![%40WeVibe__Network](https://img.shields.io/badge/%40WeVibe__Network-0a0a0a?style=flat-square&logo=x&logoColor=white)](https://x.com/WeVibe_Network)
+## Architecture
 
-</div>
+OpenCode does **not** allow one module to be both an engine plugin and a TUI plugin (`@opencode-ai/plugin` defines `TuiPluginModule = { tui, server?: never }`).
 
----
+So this repo intentionally ships two modules that act as one integration:
 
-OpenCode plugin integration for WeVibe memory retrieval, review, and injection.
+- **Engine plugin**: `plugins/wevibe-plugin.ts` (registered in `opencode.json`)
+- **TUI popup plugin**: `tui/wevibe.tsx` (registered in `tui.json`)
 
-## Overview
+They coordinate through local `.opencode/` state files (queue, decisions, heartbeat).
 
-`wevibe-opencode-plugin` is a TypeScript plugin package focused on OpenCode.
+## Runtime dependency on wevibe-mcp
 
-Current alpha implementation:
+The TUI module calls `wevibe-mcp/dist/admin.js` at runtime for identity and pairing operations.
 
-- Exports `WeVibeMemoryPlugin` from `plugins/wevibe-plugin.ts`.
-- Includes a TUI companion in `plugins/wevibe-plugin-tui.tsx` for memory review dialogs.
-- Manages moderation queue/state files in the active worktree under `.opencode/`.
-- Uses the local `wevibe-mcp` loopback API for recall, reports, denials, and serve-event forwarding.
-- Forwards serve events with matched keywords back through MCP/hub reporting paths.
-- Writes operational plugin diagnostics to `wevibe-plugin-errors.log`.
+That dependency is intentional: runtime crypto remains in `wevibe-mcp`. The installer writes the machine-specific absolute `adminScript` path into `~/.config/opencode/tui.json`.
 
-## Role in the WeVibe Network
+## Install / uninstall
 
-This repository owns the OpenCode integration surface.
-
-It connects the coding session to local WeVibe controls by:
-
-1. Pulling recalled memory candidates from local `wevibe-mcp`.
-2. Enforcing human review decisions (accept, deny, report) through local moderation queues.
-3. Injecting only approved memory into the agent context.
-4. Sending serve/report/denial events back to MCP and hub services.
-
-## Getting started
-
-### Prerequisites
-
-- Node.js
-- npm
-- OpenCode runtime with plugin loading enabled
-- Local `wevibe-mcp` instance reachable on loopback
-
-### Build
+Use package scripts:
 
 ```bash
-npm install
-npm run build
+npm run install-opencode
+npm run uninstall-opencode
 ```
 
-(`npm run build` and `npm run typecheck` both run `tsc --noEmit`.)
-
-### Run
-
-This package is loaded as an OpenCode plugin rather than run as a standalone daemon.
-
-- Main plugin entry: `plugins/wevibe-plugin.ts`
-- TUI plugin entry: `plugins/wevibe-plugin-tui.tsx`
-
-## Testing
-
-There is no standalone automated test script in this repository yet.
-
-Current validation flow is type-check based:
+Or run directly:
 
 ```bash
-npm run typecheck
+npx tsx bin/install-opencode.ts install-opencode
+npx tsx bin/install-opencode.ts uninstall-opencode
 ```
 
-## Configuration
+Supported flags:
 
-Environment variables used by the plugin:
+- `--config-dir`
+- `--node`
+- `--engine-path`
+- `--mcp-dir`
+- `--force`
+- `--json`
 
-- `WEVIBE_HUB_URL` — hub base URL used for moderation/reporting flows.
-- `WEVIBE_ORG_ID` — org ID for serve/report/denial payloads.
-- `WEVIBE_PLUGIN_DEBUG=1` — enables verbose plugin stderr output.
-- `WEVIBE_ROOT` — optional workspace-root override for locating `wevibe-mcp`.
+## Important MCP wiring behavior
 
-Local integration assumptions:
+`install-opencode` writes `mcp.wevibe` with `enabled: false` on purpose.
 
-- Local MCP HTTP endpoint: `http://127.0.0.1:4450`
-- MCP Bearer token file: `~/.wevibe/mcp-session-token`
-- Local policy config: `~/.wevibe/plugin-config.json`
-- Queue files: `.opencode/wevibe-plugin-queue.json`, `.opencode/wevibe-plugin-decisions.json`, `.opencode/wevibe-plugin-status.json`
+Reason: the engine plugin is the **sole** `:4450` MCP spawner because it provides the correct `WEVIBE_UMBRAL_SIDECAR_BIN` and `WEVIBE_GUARD_BIN` environment. A second opencode-spawned env-less MCP process would break leader-side Umbral crypto.
 
-## Roadmap
+## Reference template in this repo
 
-See [ROADMAP.md](./ROADMAP.md).
+`tui.json` in this repo is a template:
 
-## License
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": [["./tui/wevibe.tsx", {}]]
+}
+```
 
-Apache-2.0.
-
-## Links
-
-- Docs: https://github.com/WeVibe-Network/wevibe-docs
-- Org: https://github.com/WeVibe-Network
-- X: https://x.com/WeVibe_Network
+The installer writes the actual machine-specific `adminScript` option into the user config at install time.
