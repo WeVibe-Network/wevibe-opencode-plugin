@@ -37,6 +37,11 @@ interface StoredStatus {
   reported: string[]
 }
 
+interface RecallGovernorConfig {
+  relevanceFloor: number
+  maxInjected: number
+}
+
 export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, $ }) => {
   const fs = await import("node:fs")
   const { existsSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, statSync } = fs
@@ -47,6 +52,10 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const QUEUE_FILENAME = "wevibe-plugin-queue.json"
   const DECISIONS_FILENAME = "wevibe-plugin-decisions.json"
   const STATUS_FILENAME = "wevibe-plugin-status.json"
+  const PLUGIN_CONFIG_PATH = join(homedir(), ".wevibe", "plugin-config.json")
+  // PROVISIONAL: floor disabled by default (0) until calibrated against live text-embedding-3-large + hub freshness scores; recall_max_injected is the active noise control until then.
+  const DEFAULT_RECALL_RELEVANCE_FLOOR = 0
+  const DEFAULT_RECALL_MAX_INJECTED = 3
 
   const readJson = <T>(filePath: string, fallback: T): T => {
     try {
@@ -79,19 +88,45 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     }
   }
 
-  function getRiskAppetite(): "lowest" | "neutral" {
-    const configPath = join(homedir(), ".wevibe", "plugin-config.json")
+  const readPluginConfig = (): Record<string, unknown> => {
     try {
-      if (!existsSync(configPath)) return "neutral"
-      const data = readFileSync(configPath, "utf-8")
-      if (!data) return "neutral"
+      if (!existsSync(PLUGIN_CONFIG_PATH)) return {}
+      const data = readFileSync(PLUGIN_CONFIG_PATH, "utf-8")
+      if (!data) return {}
       const parsed = JSON.parse(data)
-      if (parsed.risk_appetite === "lowest" || parsed.risk_appetite === "neutral") {
-        return parsed.risk_appetite
-      }
-      return "neutral"
+      if (!parsed || typeof parsed !== "object") return {}
+      return parsed as Record<string, unknown>
     } catch {
-      return "neutral"
+      return {}
+    }
+  }
+
+  function getRiskAppetite(): "lowest" | "neutral" {
+    const parsed = readPluginConfig()
+    if (parsed.risk_appetite === "lowest" || parsed.risk_appetite === "neutral") {
+      return parsed.risk_appetite
+    }
+    return "neutral"
+  }
+
+  function getRecallGovernorConfig(): RecallGovernorConfig {
+    const parsed = readPluginConfig()
+
+    const relevanceFloor =
+      typeof parsed.recall_relevance_floor === "number" && Number.isFinite(parsed.recall_relevance_floor)
+        ? parsed.recall_relevance_floor
+        : DEFAULT_RECALL_RELEVANCE_FLOOR
+
+    const maxInjected =
+      typeof parsed.recall_max_injected === "number" &&
+      Number.isFinite(parsed.recall_max_injected) &&
+      parsed.recall_max_injected >= 0
+        ? Math.floor(parsed.recall_max_injected)
+        : DEFAULT_RECALL_MAX_INJECTED
+
+    return {
+      relevanceFloor,
+      maxInjected,
     }
   }
 
@@ -215,6 +250,20 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const pendingCids = new Set<string>()
   const servedInSession = new Set<string>()
 
+  const seedDeniedFromLocalBlacklist = (): void => {
+    const blacklistPath = join(homedir(), ".wevibe", "blacklist.json")
+    const blacklisted = readJson<unknown>(blacklistPath, [])
+    if (!Array.isArray(blacklisted)) {
+      return
+    }
+
+    for (const cid of blacklisted) {
+      if (typeof cid === "string" && cid.length > 0) {
+        deniedCids.add(cid)
+      }
+    }
+  }
+
   const statusSnapshot = readJson<StoredStatus>(statusPath, {
     accepted: [],
     denied: [],
@@ -223,6 +272,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   statusSnapshot.accepted.forEach(id => approvedCids.add(id))
   statusSnapshot.denied.forEach(id => deniedCids.add(id))
   statusSnapshot.reported.forEach(id => reportedCids.add(id))
+  seedDeniedFromLocalBlacklist()
 
   const initialQueue = readJson<PendingMemory[]>(queuePath, [])
   initialQueue.forEach(entry => pendingCids.add(entry.id))
@@ -416,7 +466,6 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 
   const cachedMemories: CachedMemory[] = []
   const contextPaths: Set<string> = new Set()
-  let lastPrompt = ""
   let lastRecalledQuery = ""
   let wevibeAvailable = false
   let memoryCacheKey = ""
@@ -595,11 +644,12 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         logRecallOutcome("none", 0, "token_missing")
         return
       }
+      const { relevanceFloor, maxInjected } = getRecallGovernorConfig()
       logPlugin("info", "[recall] loadMemories request=POST /v1/recall limit=10")
       const res = await fetch(`${WEVIBE_MCP_HTTP}/v1/recall`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ query, limit: 10, session_id: sessionId }),
+        body: JSON.stringify({ query, limit: 10, session_id: sessionId, relevance_floor: relevanceFloor, surface_budget: maxInjected }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       })
       logPlugin("info", `[recall] loadMemories response status=${res.status}`)
@@ -629,7 +679,10 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           cid: string
           text: string
           score: number
-          breakdown?: { keyword_matches?: Array<{ keyword: string }> }
+          breakdown?: {
+            keyword_matches?: Array<{ keyword: string }>
+            combined_score?: number
+          }
           matched_keywords?: string[]
           source?: string
           memory_type?: string
@@ -649,6 +702,13 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       cachedMemories.length = 0
       memoryIndex.clear()
       let statusDirty = false
+      const enqueueCandidates: Array<{
+        cid: string
+        text: string
+        source: string
+        score: number
+      }> = []
+
       for (const mem of data.memories) {
         let blocked = false
         let blockReason = ""
@@ -668,7 +728,10 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         const cacheEntry: CachedMemory = {
           cid: mem.cid,
           text: mem.text,
-          score: mem.score,
+          score:
+            (typeof mem.breakdown?.combined_score === "number" && Number.isFinite(mem.breakdown.combined_score))
+              ? mem.breakdown.combined_score
+              : mem.score,
           keywords: mem.breakdown?.keyword_matches?.map(
             (k: { keyword: string }) => k.keyword) ?? [],
           matchedKeywords: mem.matched_keywords ?? [],
@@ -697,15 +760,31 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           !reportedCids.has(cacheEntry.cid) &&
           !pendingCids.has(cacheEntry.cid)
         ) {
-          enqueuePending({
-            id: cacheEntry.cid,
+          enqueueCandidates.push({
             cid: cacheEntry.cid,
             text: cacheEntry.text,
+            score: cacheEntry.score,
             source: typeof mem.source === "string" && mem.source.length > 0 ? mem.source : cacheEntry.cid,
-            createdAt: Date.now(),
           })
         }
       }
+
+      // Hub governs relevance floor + surface budget server-side (thin-client overhaul).
+      // Enqueue every hub-returned candidate as-is — no client-side re-governing.
+      const memoriesToQueue = enqueueCandidates
+
+      for (const candidate of memoriesToQueue) {
+        enqueuePending({
+          id: candidate.cid,
+          cid: candidate.cid,
+          text: candidate.text,
+          source: candidate.source,
+          createdAt: Date.now(),
+        })
+      }
+      logDebug(
+        `[recall] queued ${memoriesToQueue.length} of ${enqueueCandidates.length} memories (floor=${relevanceFloor}, budget=${maxInjected})`,
+      )
 
       if (statusDirty) {
         recordStatusSnapshot()
@@ -810,7 +889,6 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       // The user's prompt text lives in output.parts (verified against @opencode-ai/plugin index.d.ts:183-195).
       const userPromptText = collectTextParts((output as { parts?: unknown }).parts)
       const normalizedPromptText = userPromptText.replace(/\s+/g, " ").trim()
-      lastPrompt = normalizedPromptText.toLowerCase()
 
       if (normalizedPromptText.length === 0) {
         return
@@ -830,59 +908,25 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 
     "experimental.chat.system.transform": async (input, output) => {
       await drainDecisions()
+      seedDeniedFromLocalBlacklist()
       const tuiLiveForLog = isTuiLive()
       logDebug(`[recall] transform tuiLive=${tuiLiveForLog} cached=${cachedMemories.length} approved=${approvedCids.size}`)
 
       const appetite = getRiskAppetite()
-      if (!isTuiLive()) {
-        // Headless / no interactive TUI: no popup can appear, so auto-accept the
-        // safe majority (guard-clean, not previously denied/reported, risk-respecting)
-        // so recall actually injects. Mirrors D-11.5 [No gated approval] / gated-on-risk.
-        let autoAcceptedCount = 0
-        for (const m of cachedMemories) {
-          if (m.blocked) continue
-          if (deniedCids.has(m.cid) || reportedCids.has(m.cid)) continue
-          if (appetite === "lowest" && m.memoryType !== "negative_signal") continue
-          if (!approvedCids.has(m.cid)) {
-            autoAcceptedCount += 1
-          }
-          approvedCids.add(m.cid)
-        }
-        logDebug(`[recall] headless auto-accept: approved ${autoAcceptedCount} of ${cachedMemories.length}`)
-      }
       if (appetite === "lowest") {
         logDebug("risk appetite set to lowest — filtering to negative_signal only")
       }
       const eligible = cachedMemories.filter(m => {
-        if (m.blocked || !approvedCids.has(m.cid)) return false
+        if (m.blocked || deniedCids.has(m.cid) || !approvedCids.has(m.cid)) return false
         if (appetite === "lowest" && m.memoryType !== "negative_signal") return false
         return true
       })
+
+      // Hub already governed relevance + budget; inject every approved-eligible memory as-is.
       if (eligible.length === 0) {
-        logDebug("[recall] nothing to inject (eligible=0)")
         return
       }
-
-      let matched = eligible
-      if (lastPrompt.length > 0) {
-        const promptWords = lastPrompt.split(/\s+/).filter(w => w.length > 2)
-        const scored = eligible.map(m => {
-          const textLower = m.text.toLowerCase()
-          const hits = promptWords.filter(w => textLower.includes(w)).length
-          return { memory: m, hits }
-        })
-        const withHits = scored.filter(s => s.hits > 0).sort((a, b) => b.hits - a.hits)
-        matched = withHits.length > 0
-          ? withHits.map(s => s.memory)
-          : eligible
-      }
-
-      const toInject = matched
-      if (toInject.length === 0) {
-        logDebug("[recall] nothing to inject (eligible=0)")
-        return
-      }
-      logDebug(`[recall] injecting ${toInject.length} memories`)
+      const toInject = eligible
 
       const memoryBlock = [
         "",
