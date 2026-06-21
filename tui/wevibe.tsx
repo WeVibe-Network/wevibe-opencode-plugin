@@ -8,13 +8,14 @@
 // commands), api.kv (persistence), api.event.on (session lifecycle).
 //
 // All privileged work (identity creation = Touch ID, pairing) is delegated to
-// the `wevibe-admin` CLI via a child process. No JSX is authored here (dialog
-// components are invoked as functions), so no @opentui build dependency.
+// the `wevibe-admin` CLI via a child process.
 
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { useKeyboard, useTerminalDimensions } from "@opentui/solid";
+import { createSignal, Show } from "solid-js";
 
 const SIDECAR_PATH = path.join(os.homedir(), ".wevibe", "identity.json");
 
@@ -46,16 +47,18 @@ type ReportReason = "inappropriate" | "inaccurate" | "security" | "policy" | "ot
 
 type QueueDecision = {
   memoryID: string;
-  action: "accept" | "deny" | "report";
+  action: "accept" | "deny" | "report" | "block";
   reason?: ReportReason;
   note?: string;
   timestamp: number;
 };
 
 type RiskColor = "red" | "amber" | "green";
+type RetrievalCardSection = { label: string; value: string };
 
 // Conservative midpoint: anything below this on trust/confidence is caution.
 const LOW_SIGNAL_THRESHOLD = 0.5;
+const COMPACT_MAX_HEIGHT = 36;
 
 const RISK_BADGE_BY_COLOR: Record<RiskColor, string> = {
   red: "🔴",
@@ -63,100 +66,89 @@ const RISK_BADGE_BY_COLOR: Record<RiskColor, string> = {
   green: "🟢",
 };
 
-const asRecord = (value: unknown): Record<string, unknown> | null => {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  return value as Record<string, unknown>;
+const RISK_LABEL_BY_COLOR: Record<RiskColor, string> = {
+  red: "Flagged",
+  amber: "Caution",
+  green: "Safe",
 };
 
-const hasArraySignal = (value: unknown): boolean => Array.isArray(value) && value.length > 0;
-
-const normalizeSignal = (value: unknown): number | null => {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
-  if (value <= 1) return value;
-  if (value <= 10) return value / 10;
-  if (value <= 100) return value / 100;
-  return null;
+const asFiniteNumber = (value: unknown): number | null => {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return value;
 };
 
-const firstSignal = (...candidates: unknown[]): number | null => {
-  for (const candidate of candidates) {
-    const normalized = normalizeSignal(candidate);
-    if (normalized !== null) return normalized;
+const asNonEmptyString = (value: unknown): string | null => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
+
+const asStringList = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return [];
+  const values: string[] = [];
+  for (const item of value) {
+    const normalized = asNonEmptyString(item);
+    if (normalized) values.push(normalized);
   }
-  return null;
+  return values;
+};
+
+const trunc = (s: string, n: number): string => (s.length <= n ? s : s.slice(0, Math.max(1, n - 1)) + "\u2026");
+
+const RETRIEVAL_CARD_LABELS: Array<{ label: string; matcher: RegExp }> = [
+  { label: "Applies when", matcher: /^\s*applies when\s*:\s*(.*)$/i },
+  { label: "Stack", matcher: /^\s*stack\s*:\s*(.*)$/i },
+  { label: "Implement", matcher: /^\s*implement\s*:\s*(.*)$/i },
+  { label: "Avoid", matcher: /^\s*avoid\s*:\s*(.*)$/i },
+  { label: "Anticipated need", matcher: /^\s*anticipated need\s*:\s*(.*)$/i },
+];
+
+const parseRetrievalCard = (text: string): RetrievalCardSection[] | null => {
+  if (typeof text !== "string" || text.length === 0) return null;
+
+  const lines = text.split(/\r?\n/);
+  const sections: Array<{ label: string; valueLines: string[] }> = [];
+  let current: { label: string; valueLines: string[] } | null = null;
+
+  for (const line of lines) {
+    let matched: { label: string; firstValue: string } | null = null;
+    for (const candidate of RETRIEVAL_CARD_LABELS) {
+      const hit = line.match(candidate.matcher);
+      if (hit) {
+        matched = { label: candidate.label, firstValue: (hit[1] ?? "").trim() };
+        break;
+      }
+    }
+
+    if (matched) {
+      current = { label: matched.label, valueLines: [] };
+      if (matched.firstValue.length > 0) {
+        current.valueLines.push(matched.firstValue);
+      }
+      sections.push(current);
+      continue;
+    }
+
+    if (current) {
+      current.valueLines.push(line);
+    }
+  }
+
+  if (sections.length === 0) return null;
+
+  return sections.map((section) => ({
+    label: section.label,
+    value: section.valueLines.join("\n").trim(),
+  }));
 };
 
 const riskColorForEntry = (entry: QueueEntry): RiskColor => {
-  const guard = asRecord(entry.guard);
-  const contributor = asRecord(entry.contributor);
+  const guardPassed = typeof entry.guardPassed === "boolean" ? entry.guardPassed : undefined;
+  const guardFlags = asStringList(entry.guardFlags);
+  if (guardPassed === false || guardFlags.length > 0) return "red";
 
-  if (
-    entry.blocked === true ||
-    entry.guardBlocked === true ||
-    entry.isBlocked === true ||
-    guard?.blocked === true ||
-    guard?.flagged === true ||
-    guard?.passed === false
-  ) {
-    return "red";
-  }
-
-  const stateSignals = [entry.state, entry.status, entry.riskState, guard?.state, guard?.status, guard?.result];
-  if (
-    stateSignals.some(
-      (value) => typeof value === "string" && /(blocked|danger|dangerous|flagged|denied?|fail(?:ed)?|unsafe|malicious)/i.test(value),
-    )
-  ) {
-    return "red";
-  }
-
-  if (
-    hasArraySignal(entry.flags) ||
-    hasArraySignal(entry.guardFlags) ||
-    hasArraySignal(entry.guard_flags) ||
-    hasArraySignal(guard?.flags) ||
-    hasArraySignal(guard?.detections)
-  ) {
-    return "red";
-  }
-
-  const trustedSignals = [
-    entry.trustedContributor,
-    entry.trusted_contributor,
-    entry.isTrustedContributor,
-    entry.isTrusted,
-    contributor?.trusted,
-    contributor?.isTrusted,
-  ];
-  if (trustedSignals.some((value) => value === false)) {
-    return "amber";
-  }
-
-  const trustSignal = firstSignal(
-    entry.trust,
-    entry.trustScore,
-    entry.trust_score,
-    entry.contributorTrust,
-    entry.contributor_trust,
-    contributor?.trust,
-    contributor?.trustScore,
-    contributor?.trust_score,
-  );
-  const confidenceSignal = firstSignal(
-    entry.confidence,
-    entry.confidenceScore,
-    entry.confidence_score,
-    entry.score,
-    entry.recallScore,
-    entry.recall_score,
-  );
-
-  if (
-    (trustSignal !== null && trustSignal < LOW_SIGNAL_THRESHOLD) ||
-    (confidenceSignal !== null && confidenceSignal < LOW_SIGNAL_THRESHOLD)
-  ) {
-    return "amber";
-  }
+  const score = asFiniteNumber(entry.score);
+  if (score !== null && score < LOW_SIGNAL_THRESHOLD) return "amber";
 
   return "green";
 };
@@ -344,13 +336,6 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
     }
   };
 
-  const truncate = (value: string, max: number) => {
-    if (typeof value !== "string") return "";
-    if (value.length <= max) return value;
-    if (max <= 1) return "…";
-    return `${value.slice(0, max - 1)}…`;
-  };
-
   const RISK_CONFIG_PATH = path.join(os.homedir(), ".wevibe", "plugin-config.json");
 
   const getRiskAppetite = (): "lowest" | "neutral" => {
@@ -440,6 +425,9 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
     }
   };
 
+  const REVIEW_ROUTE = "wevibe-review";
+  const [reviewEntry, setReviewEntry] = createSignal<QueueEntry | null>(null);
+  let reviewReturnSessionID: string | undefined;
   let activeMemoryId: string | null = null;
   let reviewDialogNonce = 0;
 
@@ -460,10 +448,37 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
     }
   };
 
-  const queueAdvance = () => {
+  const finishReview = async () => {
+    const queue = await readQueueAsync();
+    const next = queue[0];
+    if (next) {
+      activeMemoryId = next.id;
+      setReviewEntry(next);
+      return;
+    }
     activeMemoryId = null;
-    wevibeDialogActive = false;
-    setTimeout(() => void processQueue(), 0);
+    setReviewEntry(null);
+    const sessionID = reviewReturnSessionID;
+    reviewReturnSessionID = undefined;
+    if (sessionID) {
+      api.route.navigate("session", { sessionID });
+    } else {
+      api.route.navigate("home");
+    }
+  };
+
+  const decideReview = (entry: QueueEntry, action: "accept" | "deny" | "block", variant: string, message: string) => {
+    recordDecision({ memoryID: entry.id, action, timestamp: Date.now() });
+    toast(variant, message);
+    void finishReview();
+  };
+
+  const openReviewReport = (entry: QueueEntry) => {
+    showReportReasonDialog(entry);
+  };
+
+  const queueAdvance = () => {
+    void finishReview();
   };
 
   const reportReasonOptions: Array<{ title: string; value: ReportReason; description: string }> = [
@@ -473,6 +488,306 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
     { title: "Policy", value: "policy", description: "Violates policy or usage guidelines" },
     { title: "Other", value: "other", description: "Another issue not listed above" },
   ];
+
+  const MemoryReview = (props: { entry: QueueEntry }) => {
+    const theme = api?.theme?.current ?? {};
+    const [selectedIndex, setSelectedIndex] = createSignal(0);
+    const [armed, setArmed] = createSignal(false);
+    const dim = useTerminalDimensions();
+    const compact = dim().height < COMPACT_MAX_HEIGHT;
+
+    const riskColor = riskColorForEntry(props.entry);
+    const riskBadge = RISK_BADGE_BY_COLOR[riskColor];
+    const riskLabel = RISK_LABEL_BY_COLOR[riskColor];
+    const riskBorderColor = riskColor === "red" ? theme.error : riskColor === "amber" ? theme.warning : theme.success;
+
+    const score = asFiniteNumber(props.entry.score);
+    const vectorScore = asFiniteNumber(props.entry.vectorScore);
+    const keywordScore = asFiniteNumber(props.entry.keywordScore);
+    const memoryType = asNonEmptyString(props.entry.memoryType);
+    const matchedKeywords = asStringList(props.entry.matchedKeywords);
+    const guardFlags = asStringList(props.entry.guardFlags);
+    const guardPassed = typeof props.entry.guardPassed === "boolean" ? props.entry.guardPassed : undefined;
+    const guardFlagged = guardPassed === false || guardFlags.length > 0;
+    const trustPanel = asNonEmptyString(props.entry.trustPanel);
+    const cid = asNonEmptyString(props.entry.cid);
+    const text = typeof props.entry.text === "string" ? props.entry.text : "";
+    const cardSections = parseRetrievalCard(text);
+
+    const relevanceSignals: string[] = [];
+    if (vectorScore !== null) relevanceSignals.push(`sem ${Math.round(vectorScore * 100)}%`);
+    if (keywordScore !== null) relevanceSignals.push(`kw ${Math.round(keywordScore * 100)}%`);
+    const relevance =
+      score !== null
+        ? `${Math.round(score * 100)}%${relevanceSignals.length > 0 ? ` (${relevanceSignals.join(" · ")})` : ""}`
+        : null;
+
+    const detailRows: Array<{ label: string; value: string; fg?: string }> = [];
+    if (relevance) {
+      detailRows.push({ label: "Relevance", value: relevance });
+    }
+    if (memoryType) {
+      detailRows.push({ label: "Type", value: memoryType });
+    }
+    if (matchedKeywords.length > 0) {
+      detailRows.push({ label: "Matched", value: matchedKeywords.join(", ") });
+    }
+    detailRows.push({
+      label: "Guard",
+      value: guardFlagged ? `FLAGGED${guardFlags.length > 0 ? ` — ${guardFlags.join(", ")}` : ""}` : "clean",
+      fg: guardFlagged ? theme.error : theme.success,
+    });
+    if (cid) {
+      detailRows.push({ label: "Ref", value: cid.slice(0, 8) });
+    }
+
+    const renderInlineCard = () => (
+      <box style={{ flexDirection: "column", width: "100%" }}>
+        {cardSections ? (
+          cardSections.map((section) => (
+            <box style={{ flexDirection: "column", width: "100%" }}>
+              <text>
+                <span style={{ fg: theme.accent }}>{`${section.label}: `}</span>
+                <span style={{ fg: theme.text }}>{section.value.replace(/\s*\n\s*/g, " ")}</span>
+              </text>
+            </box>
+          ))
+        ) : (
+          <text>{text}</text>
+        )}
+      </box>
+    );
+
+    const actions: Array<{ label: string; description: string; run: () => void }> = [
+      {
+        label: "Accept",
+        description: "Inject into context (records a serve)",
+        run: () => decideReview(props.entry, "accept", "success", "Memory accepted"),
+      },
+      {
+        label: "Deny",
+        description: "Not useful now — hidden this session (corpus-neutral)",
+        run: () => decideReview(props.entry, "deny", "info", "Memory denied"),
+      },
+      {
+        label: "Block",
+        description: "Never useful — permanent personal block",
+        run: () => decideReview(props.entry, "block", "warning", "Memory blocked"),
+      },
+      {
+        label: "Report",
+        description: "Harmful or wrong — flag & escalate",
+        run: () => openReviewReport(props.entry),
+      },
+    ];
+
+    useKeyboard((evt: any) => {
+      if (api.route.current?.name !== REVIEW_ROUTE) return;
+      if (api.ui?.dialog?.open) return;
+
+      const name = typeof evt?.name === "string" ? evt.name.toLowerCase() : "";
+      if (name === "pageup" || name === "pagedown") {
+        return;
+      }
+
+      if (armed()) {
+        evt.preventDefault?.();
+        evt.stopPropagation?.();
+
+        if (name === "return" || name === "enter") {
+          setArmed(false);
+          const selected = actions[selectedIndex()] ?? actions[0];
+          selected.run();
+          return;
+        }
+
+        if (name === "escape") {
+          setArmed(false);
+          return;
+        }
+
+        return;
+      }
+
+      if (name === "up" || name === "k") {
+        evt.preventDefault?.();
+        evt.stopPropagation?.();
+        setSelectedIndex((index) => (index + 3) % 4);
+        return;
+      }
+
+      if (name === "down" || name === "j") {
+        evt.preventDefault?.();
+        evt.stopPropagation?.();
+        setSelectedIndex((index) => (index + 1) % 4);
+        return;
+      }
+
+      if (name === "return" || name === "enter") {
+        evt.preventDefault?.();
+        evt.stopPropagation?.();
+        setArmed(true);
+        return;
+      }
+
+      if (name === "escape") {
+        evt.preventDefault?.();
+        evt.stopPropagation?.();
+        decideReview(props.entry, "deny", "info", "Memory denied");
+        return;
+      }
+
+      if (name === "a") {
+        evt.preventDefault?.();
+        evt.stopPropagation?.();
+        setSelectedIndex(0);
+        return;
+      }
+
+      if (name === "d") {
+        evt.preventDefault?.();
+        evt.stopPropagation?.();
+        setSelectedIndex(1);
+        return;
+      }
+
+      if (name === "b") {
+        evt.preventDefault?.();
+        evt.stopPropagation?.();
+        setSelectedIndex(2);
+        return;
+      }
+
+      if (name === "r") {
+        evt.preventDefault?.();
+        evt.stopPropagation?.();
+        setSelectedIndex(3);
+      }
+    });
+
+    if (compact) {
+      const pct = score !== null ? `${Math.round(score * 100)}%` : "—";
+      const trustOneLine = trustPanel
+        ? trustPanel
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0)
+            .join(" · ")
+        : "";
+      const memoryTypeLabel = memoryType ?? "unknown";
+      const refSegment = cid ? ` · ref ${cid.slice(0, 8)}` : "";
+
+      return (
+        <box style={{ flexDirection: "column", width: "100%", height: "100%" }}>
+          <text style={{ flexShrink: 0 }} fg={riskBorderColor}>
+            {trunc(`${riskBadge} ${riskLabel} · ${pct} relevance · ${memoryTypeLabel}${refSegment}`, dim().width)}
+          </text>
+
+          <box
+            border
+            borderStyle="rounded"
+            borderColor={theme.border}
+            title="Memory"
+            style={{ flexDirection: "column", flexGrow: 1, minHeight: 3, paddingLeft: 1, paddingRight: 1 }}
+          >
+            <scrollbox focused contentOptions={{ width: "100%" }} style={{ flexGrow: 1, minHeight: 0, width: "100%" }}>
+              {renderInlineCard()}
+            </scrollbox>
+            <text style={{ flexShrink: 0 }} fg={theme.textMuted}>
+              {trunc(`matched: ${matchedKeywords.join(", ") || "—"}${trustOneLine ? "  ·  " + trustOneLine : ""}`, dim().width - 3)}
+            </text>
+          </box>
+
+          <box style={{ flexDirection: "row", width: "100%", flexShrink: 0 }}>
+            {actions.map((action, index) => {
+              const selected = selectedIndex() === index;
+              return (
+                <text fg={selected ? theme.background : theme.textMuted} bg={selected ? theme.primary : undefined}>
+                  {selected ? ` ▶ ${action.label} ` : `   ${action.label} `}
+                </text>
+              );
+            })}
+          </box>
+
+          <text style={{ flexShrink: 0 }} fg={theme.textMuted}>
+            {armed()
+              ? "⏎ Enter to confirm · Esc cancel"
+              : "↑↓ select · Enter then Enter to confirm · PgUp/PgDn scroll · Esc deny"}
+          </text>
+        </box>
+      );
+    }
+
+    return (
+      <box style={{ flexDirection: "column", width: "100%", height: "100%", minHeight: 0, padding: 1 }}>
+        <box border borderStyle="rounded" borderColor={riskBorderColor} style={{ flexDirection: "column", flexShrink: 0, padding: 1 }}>
+          <text>{`${riskBadge} WeVibe — Review Memory     ·  ${riskLabel}`}</text>
+        </box>
+
+        <box border borderStyle="rounded" borderColor={theme.border} title="Details" style={{ flexDirection: "column", flexShrink: 0, padding: 1 }}>
+          {detailRows.map((row) => (
+            <box style={{ flexDirection: "row" }}>
+              <text fg={theme.textMuted}>{`${row.label}: `}</text>
+              <text fg={row.fg}>{row.value}</text>
+            </box>
+          ))}
+        </box>
+
+        {trustPanel ? (
+          <box
+            border
+            borderStyle="rounded"
+            borderColor={theme.border}
+            title="Contributor / Trust"
+            style={{ flexDirection: "column", flexShrink: 0, padding: 1 }}
+          >
+            {trustPanel.split(/\r?\n/).map((line) => (
+              <text>{line}</text>
+            ))}
+          </box>
+        ) : null}
+
+        <box
+          border
+          borderStyle="rounded"
+          borderColor={theme.border}
+          title="Memory"
+	          style={{ flexDirection: "column", flexGrow: 1, minHeight: 5, padding: 1 }}
+        >
+	          <scrollbox focused contentOptions={{ width: "100%" }} style={{ flexGrow: 1, minHeight: 0, width: "100%" }}>
+	            {renderInlineCard()}
+	          </scrollbox>
+        </box>
+
+        <box border borderStyle="rounded" borderColor={theme.border} title="Action" style={{ flexDirection: "column", flexShrink: 0, padding: 1 }}>
+          {actions.map((action, index) => {
+            const selected = selectedIndex() === index;
+            const prefix = selected ? "▶ " : "  ";
+            const confirmCue = armed() && selected ? " · ⏎ press Enter again to confirm · Esc to cancel" : "";
+            return (
+              <box backgroundColor={selected ? theme.primary : undefined} style={{ flexDirection: "row", width: "100%" }}>
+                <text fg={selected ? theme.background : theme.textMuted}>{`${prefix}${action.label} — ${action.description}${confirmCue}`}</text>
+              </box>
+            );
+          })}
+        </box>
+
+        <text style={{ flexShrink: 0 }} fg={theme.textMuted}>↑/↓ choose · Enter then Enter to confirm · PgUp/PgDn scroll · Esc = Deny</text>
+      </box>
+    );
+  };
+
+  const ReviewScreen = () => {
+    const dim = useTerminalDimensions();
+
+    return (
+      <box style={{ width: dim().width, height: dim().height, flexDirection: "column" }}>
+        <Show when={reviewEntry()} keyed>
+          {(entry) => <MemoryReview entry={entry} />}
+        </Show>
+      </box>
+    );
+  };
 
   const showRiskDialog = () => {
     if (coreDialogBusy()) {
@@ -517,43 +832,16 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
   };
 
   const showReviewDialog = (entry: QueueEntry) => {
-    const riskColor = riskColorForEntry(entry);
-    const riskBadge = RISK_BADGE_BY_COLOR[riskColor];
-    openReviewDialog(
-      () =>
-        api.ui.DialogSelect({
-          // DialogSelect does not expose a border-color prop in the plugin API,
-          // so show a color-coded badge in the title as the top-of-popup cue.
-          title: `${riskBadge} WeVibe — Review Memory`,
-          placeholder: `Memory\n\n"${truncate(entry.text, 600)}"\n\nref: ${entry.cid.slice(0, 8)}`,
-          options: [
-            { title: "Accept — inject into session", value: "accept" as const },
-            { title: "Deny — discard", value: "deny" as const },
-            { title: "Report — flag & discard", value: "report" as const },
-            { title: "⚙ Risk appetite…", value: "risk" as const },
-          ],
-          onSelect: (option: { value: "accept" | "deny" | "report" | "risk" }) => {
-            const action = option?.value;
-            if (action === "accept") {
-              showAcceptConfirm(entry);
-            } else if (action === "deny") {
-              showDenyConfirm(entry);
-            } else if (action === "report") {
-              showReportReasonDialog(entry);
-            } else if (action === "risk") {
-              try {
-                api.ui.dialog.clear();
-              } catch {
-                /* ignore */
-              }
-              setTimeout(() => showRiskDialog(), 0);
-            }
-          },
-        }),
-      () => {
-        activeMemoryId = null;
-      },
-    );
+    const cur: any = api.route?.current;
+    if (cur?.name === "session" && typeof cur?.params?.sessionID === "string") {
+      reviewReturnSessionID = cur.params.sessionID;
+    }
+    setReviewEntry(entry);
+    try {
+      api.route.navigate(REVIEW_ROUTE);
+    } catch {
+      /* ignore */
+    }
   };
 
   const showReviewActionConfirm = (
@@ -581,53 +869,24 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
             if (selection === "confirm") {
               config.onConfirm();
             } else {
-              showReviewDialog(entry);
+              try {
+                api.ui.dialog.clear();
+              } catch {
+                /* ignore */
+              }
             }
           },
         }),
       () => {
         if (!handled) {
-          showReviewDialog(entry);
+          try {
+            api.ui.dialog.clear();
+          } catch {
+            /* ignore */
+          }
         }
       },
     );
-  };
-
-  const showAcceptConfirm = (entry: QueueEntry) => {
-    showReviewActionConfirm(entry, {
-      title: "Accept this memory?",
-      explainer:
-        "Inject this memory into the agent's context now.\nA serve will be recorded to signal this memory was useful.",
-      confirmTitle: "Confirm Accept",
-      onConfirm: () => {
-        recordDecision({ memoryID: entry.id, action: "accept", timestamp: Date.now() });
-        toast("success", "Memory accepted");
-        try {
-          api.ui.dialog.clear();
-        } catch {
-          /* ignore */
-        }
-        queueAdvance();
-      },
-    });
-  };
-
-  const showDenyConfirm = (entry: QueueEntry) => {
-    showReviewActionConfirm(entry, {
-      title: "Deny this memory?",
-      explainer: "Discard this memory from this review queue.\nA denial decision will be recorded.",
-      confirmTitle: "Confirm Deny",
-      onConfirm: () => {
-        recordDecision({ memoryID: entry.id, action: "deny", timestamp: Date.now() });
-        toast("info", "Memory denied");
-        try {
-          api.ui.dialog.clear();
-        } catch {
-          /* ignore */
-        }
-        queueAdvance();
-      },
-    });
   };
 
   const showReportConfirm = (entry: QueueEntry, reason: ReportReason, noteInput?: string) => {
@@ -687,7 +946,11 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
             if (reason === "inappropriate" || reason === "inaccurate" || reason === "security" || reason === "policy" || reason === "other") {
               showReportNotePrompt(entry, reason);
             } else {
-              showReviewDialog(entry);
+              try {
+                api.ui.dialog.clear();
+              } catch {
+                /* ignore */
+              }
             }
           },
         }),
@@ -704,6 +967,14 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
     if (coreDialogBusy()) {
       if (force) {
         toast("info", "Finish the current prompt first, then run /wevibe-review.");
+      }
+      return;
+    }
+
+    const routeName = api?.route?.current?.name;
+    if (routeName !== "session") {
+      if (force) {
+        toast("info", "Open a session (submit a prompt) to review pending memories.");
       }
       return;
     }
@@ -955,6 +1226,12 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
   }
 
   // --- Slash commands / palette entries ------------------------------------
+  try {
+    api.route.register([{ name: REVIEW_ROUTE, render: () => <ReviewScreen /> }]);
+  } catch {
+    /* route API unavailable */
+  }
+
   try {
     api.keymap.registerLayer({
       commands: [

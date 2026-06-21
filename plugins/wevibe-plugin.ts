@@ -21,11 +21,19 @@ interface PendingMemory {
   text: string
   source: string
   createdAt: number
+  score?: number
+  vectorScore?: number
+  keywordScore?: number
+  matchedKeywords?: string[]
+  memoryType?: string
+  guardPassed?: boolean
+  guardFlags?: string[]
+  trustPanel?: string
 }
 
 interface StoredDecision {
   memoryID: string
-  action: "accept" | "deny" | "report"
+  action: "accept" | "deny" | "block" | "report"
   reason?: string
   note?: string
   timestamp: number
@@ -38,24 +46,36 @@ interface StoredStatus {
 }
 
 interface RecallGovernorConfig {
+  mode: "prod" | "test"
   relevanceFloor: number
   maxInjected: number
+  recallLimit: number
 }
 
 export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, $ }) => {
   const fs = await import("node:fs")
   const { existsSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, statSync } = fs
-  const { randomBytes } = await import("node:crypto")
-  const sessionId = randomBytes(20).toString("hex")
 
   const STATE_DIRNAME = ".opencode"
   const QUEUE_FILENAME = "wevibe-plugin-queue.json"
   const DECISIONS_FILENAME = "wevibe-plugin-decisions.json"
   const STATUS_FILENAME = "wevibe-plugin-status.json"
   const PLUGIN_CONFIG_PATH = join(homedir(), ".wevibe", "plugin-config.json")
-  // PROVISIONAL: floor disabled by default (0) until calibrated against live text-embedding-3-large + hub freshness scores; recall_max_injected is the active noise control until then.
-  const DEFAULT_RECALL_RELEVANCE_FLOOR = 0
-  const DEFAULT_RECALL_MAX_INJECTED = 3
+  // Recall governor defaults are mode-driven via WEVIBE_RECALL_MODE.
+  // prod (default): floor=0.55, budget=3, limit=3; test: floor=0, budget=1000, limit=1000.
+  const PROD_RECALL_GOVERNOR_DEFAULTS = {
+    relevanceFloor: 0.55,
+    maxInjected: 3,
+    recallLimit: 3,
+  }
+  const TEST_RECALL_GOVERNOR_DEFAULTS = {
+    relevanceFloor: 0,
+    maxInjected: 1000,
+    recallLimit: 1000,
+  }
+  const RECALL_IN_FLIGHT_AWAIT_TIMEOUT_MS = 15_000
+  const INJECT_GATE_POLL_INTERVAL_MS = 250
+  const INJECT_GATE_TIMEOUT_MS = 300_000
 
   const readJson = <T>(filePath: string, fallback: T): T => {
     try {
@@ -109,24 +129,33 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     return "neutral"
   }
 
+  function getRecallMode(): "prod" | "test" {
+    const mode = process.env.WEVIBE_RECALL_MODE?.trim().toLowerCase()
+    return mode === "test" ? "test" : "prod"
+  }
+
   function getRecallGovernorConfig(): RecallGovernorConfig {
     const parsed = readPluginConfig()
+    const mode = getRecallMode()
+    const modeDefaults = mode === "test" ? TEST_RECALL_GOVERNOR_DEFAULTS : PROD_RECALL_GOVERNOR_DEFAULTS
 
     const relevanceFloor =
       typeof parsed.recall_relevance_floor === "number" && Number.isFinite(parsed.recall_relevance_floor)
         ? parsed.recall_relevance_floor
-        : DEFAULT_RECALL_RELEVANCE_FLOOR
+        : modeDefaults.relevanceFloor
 
     const maxInjected =
       typeof parsed.recall_max_injected === "number" &&
       Number.isFinite(parsed.recall_max_injected) &&
       parsed.recall_max_injected >= 0
         ? Math.floor(parsed.recall_max_injected)
-        : DEFAULT_RECALL_MAX_INJECTED
+        : modeDefaults.maxInjected
 
     return {
+      mode,
       relevanceFloor,
       maxInjected,
+      recallLimit: modeDefaults.recallLimit,
     }
   }
 
@@ -248,7 +277,17 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const deniedCids = new Set<string>()
   const reportedCids = new Set<string>()
   const pendingCids = new Set<string>()
-  const servedInSession = new Set<string>()
+  let activeSessionId: string | null = null
+  const sessionInjectedCids = new Map<string, Set<string>>()
+  const getSessionInjected = (sid: string): Set<string> => {
+    let injected = sessionInjectedCids.get(sid)
+    if (!injected) {
+      injected = new Set<string>()
+      sessionInjectedCids.set(sid, injected)
+    }
+    return injected
+  }
+  const currentSessionId = (): string => activeSessionId ?? "prewarm"
 
   const seedDeniedFromLocalBlacklist = (): void => {
     const blacklistPath = join(homedir(), ".wevibe", "blacklist.json")
@@ -269,7 +308,9 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     denied: [],
     reported: [],
   })
-  statusSnapshot.accepted.forEach(id => approvedCids.add(id))
+  if (getRecallMode() !== "test") {
+    statusSnapshot.accepted.forEach(id => approvedCids.add(id))
+  }
   statusSnapshot.denied.forEach(id => deniedCids.add(id))
   statusSnapshot.reported.forEach(id => reportedCids.add(id))
   seedDeniedFromLocalBlacklist()
@@ -359,6 +400,14 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       }
 
       if (decision.action === "deny") {
+        approvedCids.delete(decision.memoryID)
+        deniedCids.add(decision.memoryID)
+        reportedCids.delete(decision.memoryID)
+
+        continue
+      }
+
+      if (decision.action === "block") {
         approvedCids.delete(decision.memoryID)
         deniedCids.add(decision.memoryID)
         reportedCids.delete(decision.memoryID)
@@ -644,12 +693,12 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         logRecallOutcome("none", 0, "token_missing")
         return
       }
-      const { relevanceFloor, maxInjected } = getRecallGovernorConfig()
-      logPlugin("info", "[recall] loadMemories request=POST /v1/recall limit=10")
+      const { relevanceFloor, maxInjected, recallLimit } = getRecallGovernorConfig()
+      logPlugin("info", `[recall] loadMemories request=POST /v1/recall limit=${recallLimit}`)
       const res = await fetch(`${WEVIBE_MCP_HTTP}/v1/recall`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ query, limit: 10, session_id: sessionId, relevance_floor: relevanceFloor, surface_budget: maxInjected }),
+        body: JSON.stringify({ query, limit: recallLimit, session_id: currentSessionId(), relevance_floor: relevanceFloor, surface_budget: maxInjected }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       })
       logPlugin("info", `[recall] loadMemories response status=${res.status}`)
@@ -682,10 +731,13 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           breakdown?: {
             keyword_matches?: Array<{ keyword: string }>
             combined_score?: number
+            vector_score?: number
+            keyword_score?: number
           }
           matched_keywords?: string[]
           source?: string
           memory_type?: string
+          trust_panel?: string
           guard?: {
             passed: boolean
             detections?: Array<{ field: string; scanner: string; rule: string }>
@@ -707,6 +759,13 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         text: string
         source: string
         score: number
+        vectorScore?: number
+        keywordScore?: number
+        matchedKeywords?: string[]
+        memoryType?: string
+        guardPassed?: boolean
+        guardFlags?: string[]
+        trustPanel?: string
       }> = []
 
       for (const mem of data.memories) {
@@ -754,17 +813,40 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           continue
         }
 
+        if (getRecallMode() === "test") {
+          approvedCids.delete(cacheEntry.cid)
+          getSessionInjected(currentSessionId()).delete(cacheEntry.cid)
+        }
+
         if (
           !approvedCids.has(cacheEntry.cid) &&
           !deniedCids.has(cacheEntry.cid) &&
           !reportedCids.has(cacheEntry.cid) &&
           !pendingCids.has(cacheEntry.cid)
         ) {
+          const vectorScore =
+            typeof mem.breakdown?.vector_score === "number" && Number.isFinite(mem.breakdown.vector_score)
+              ? mem.breakdown.vector_score
+              : undefined
+          const keywordScore =
+            typeof mem.breakdown?.keyword_score === "number" && Number.isFinite(mem.breakdown.keyword_score)
+              ? mem.breakdown.keyword_score
+              : undefined
+          const trustPanel =
+            typeof mem.trust_panel === "string" && mem.trust_panel.length > 0 ? mem.trust_panel : undefined
+
           enqueueCandidates.push({
             cid: cacheEntry.cid,
             text: cacheEntry.text,
             score: cacheEntry.score,
             source: typeof mem.source === "string" && mem.source.length > 0 ? mem.source : cacheEntry.cid,
+            matchedKeywords: cacheEntry.matchedKeywords ?? [],
+            memoryType: cacheEntry.memoryType,
+            guardPassed: mem.guard ? mem.guard.passed : true,
+            guardFlags: cacheEntry.flags ?? [],
+            ...(vectorScore !== undefined ? { vectorScore } : {}),
+            ...(keywordScore !== undefined ? { keywordScore } : {}),
+            ...(trustPanel !== undefined ? { trustPanel } : {}),
           })
         }
       }
@@ -780,6 +862,14 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           text: candidate.text,
           source: candidate.source,
           createdAt: Date.now(),
+          score: candidate.score,
+          vectorScore: candidate.vectorScore,
+          keywordScore: candidate.keywordScore,
+          matchedKeywords: candidate.matchedKeywords,
+          memoryType: candidate.memoryType,
+          guardPassed: candidate.guardPassed,
+          guardFlags: candidate.guardFlags,
+          trustPanel: candidate.trustPanel,
         })
       }
       logDebug(
@@ -839,6 +929,11 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const queryToUse = validContextParts.length > 0 ? validContextParts.join(" ") : "project coding standards conventions best practices"
   void (async () => {
     try {
+      const recallMode = getRecallMode()
+      logPlugin("info", `[recall] mode=${recallMode}`)
+      if (recallMode === "test") {
+        logPlugin("warn", "TEST MODE — recall governor bypassed (floor=0 budget=1000 limit=1000)")
+      }
       wevibeAvailable = await ensureWeVibeMcpRunning()
       logPlugin("info", `[recall] init worktree=${worktree} dir=${directory} contextParts=${validContextParts.length} query="${queryToUse.slice(0,80)}"`)
       logPlugin("info", `[recall] init wevibeAvailable=${wevibeAvailable}`)
@@ -876,7 +971,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   }
 
   return {
-    "tool.execute.before": async (input, output) => {
+    "tool.execute.before": async (_input, output) => {
       const args = output.args as Record<string, unknown>
       const filePath = (args.filePath ?? args.path ?? args.file) as string | undefined
       if (filePath && typeof filePath === "string") {
@@ -884,7 +979,9 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       }
     },
 
-    "chat.message": async (_input, output) => {
+    "chat.message": async (input, output) => {
+      if (input?.sessionID) activeSessionId = input.sessionID
+
       // opencode's chat.message API: `input` has NO parts; `output` = { message: UserMessage, parts: Part[] }.
       // The user's prompt text lives in output.parts (verified against @opencode-ai/plugin index.d.ts:183-195).
       const userPromptText = collectTextParts((output as { parts?: unknown }).parts)
@@ -907,8 +1004,62 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     },
 
     "experimental.chat.system.transform": async (input, output) => {
+      if (input?.sessionID) activeSessionId = input.sessionID
+
+      if (recallInFlight) {
+        let recallWaitTimedOut = false
+        await Promise.race([
+          recallInFlight,
+          new Promise<void>(resolve => {
+            setTimeout(() => {
+              recallWaitTimedOut = true
+              resolve()
+            }, RECALL_IN_FLIGHT_AWAIT_TIMEOUT_MS)
+          }),
+        ])
+
+        if (recallWaitTimedOut) {
+          logDebug(`[recall] transform recall wait timeout after ${RECALL_IN_FLIGHT_AWAIT_TIMEOUT_MS}ms`)
+        }
+      }
+
       await drainDecisions()
       seedDeniedFromLocalBlacklist()
+
+      const getPendingUndecidedCids = (): Set<string> => {
+        const pending = new Set<string>()
+
+        for (const memory of cachedMemories) {
+          if (memory.blocked) continue
+          if (approvedCids.has(memory.cid)) continue
+          if (deniedCids.has(memory.cid)) continue
+          if (reportedCids.has(memory.cid)) continue
+          pending.add(memory.cid)
+        }
+
+        return pending
+      }
+
+      let pendingUndecidedCids = getPendingUndecidedCids()
+      if (isTuiLive() && pendingUndecidedCids.size > 0) {
+        const gateStartedAt = Date.now()
+
+        while (pendingUndecidedCids.size > 0) {
+          if (!isTuiLive()) {
+            break
+          }
+
+          if (Date.now() - gateStartedAt >= INJECT_GATE_TIMEOUT_MS) {
+            logDebug(`[recall] transform gate timeout pending=${pendingUndecidedCids.size}`)
+            break
+          }
+
+          await new Promise(resolve => setTimeout(resolve, INJECT_GATE_POLL_INTERVAL_MS))
+          await drainDecisions()
+          pendingUndecidedCids = getPendingUndecidedCids()
+        }
+      }
+
       const tuiLiveForLog = isTuiLive()
       logDebug(`[recall] transform tuiLive=${tuiLiveForLog} cached=${cachedMemories.length} approved=${approvedCids.size}`)
 
@@ -924,9 +1075,19 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 
       // Hub already governed relevance + budget; inject every approved-eligible memory as-is.
       if (eligible.length === 0) {
+        logPlugin(
+          "info",
+          `[inject] ${new Date().toISOString()} nothing injected (cached=${cachedMemories.length} approved=${approvedCids.size} denied=${deniedCids.size} appetite=${appetite})`,
+        )
         return
       }
-      const toInject = eligible
+      const sid = currentSessionId()
+      const injectedSet = getSessionInjected(sid)
+      const toInject = eligible.filter(m => !injectedSet.has(m.cid))
+      if (toInject.length === 0) {
+        logPlugin("info", `[inject] ${new Date().toISOString()} nothing new to inject this session sid=${sid} (eligible=${eligible.length})`)
+        return
+      }
 
       const memoryBlock = [
         "",
@@ -942,12 +1103,18 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       ].join("\n")
 
       output.system.push(memoryBlock)
+      logPlugin(
+        "info",
+        `[inject] ${new Date().toISOString()} sid=${sid} injected ${toInject.length} memories: ` +
+          toInject
+            .map(m => `${m.cid.slice(0, 12)}(score=${m.score.toFixed(3)}, "${m.text.slice(0, 60).replace(/\s+/g, " ")}")`)
+            .join(" | "),
+      )
 
       for (const mem of toInject) {
-        if (servedInSession.has(mem.cid)) continue
+        injectedSet.add(mem.cid)
         const token = readWeVibeMcpToken()
         if (token && orgId) {
-          servedInSession.add(mem.cid)
           fetch(`${WEVIBE_MCP_HTTP}/v1/serves`, {
             method: "POST",
             headers: {
@@ -959,7 +1126,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
               memory_hash: mem.cid,
               nullifier: mem.cid,
               matched_keywords: mem.matchedKeywords ?? [],
-              session_id: sessionId,
+              session_id: sid,
             }),
             signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
           }).catch(() => {})

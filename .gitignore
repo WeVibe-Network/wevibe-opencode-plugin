@@ -35,3 +35,9 @@ AGENTS.md
 MANAGER.md
 WORKER.md
 SESSIONCONTINUANCE.md
+
+# local TUI visual-debug harness (not for commit)
+tui/_render_harness.tsx
+tui/_bisect.tsx
+tui/_render_compact.tsx
+tui/_render_responsive.tsx
