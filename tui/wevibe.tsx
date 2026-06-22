@@ -558,28 +558,37 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
       </box>
     );
 
-    const actions: Array<{ label: string; description: string; run: () => void }> = [
-      {
-        label: "Accept",
-        description: "Inject into context (records a serve)",
-        run: () => decideReview(props.entry, "accept", "success", "Memory accepted"),
-      },
-      {
-        label: "Deny",
-        description: "Not useful now — hidden this session (corpus-neutral)",
-        run: () => decideReview(props.entry, "deny", "info", "Memory denied"),
-      },
-      {
-        label: "Block",
-        description: "Never useful — permanent personal block",
-        run: () => decideReview(props.entry, "block", "warning", "Memory blocked"),
-      },
-      {
-        label: "Report",
-        description: "Harmful or wrong — flag & escalate",
-        run: () => openReviewReport(props.entry),
-      },
-    ];
+    const acceptAction = {
+      label: "Accept",
+      description: "Inject into context (records a serve)",
+      run: () => decideReview(props.entry, "accept", "success", "Memory accepted"),
+    };
+    const denyAction = {
+      label: "Deny",
+      description: "Not useful now — hidden this session (corpus-neutral)",
+      run: () => decideReview(props.entry, "deny", "info", "Memory denied"),
+    };
+    const blockAction = {
+      label: "Block",
+      description: "Never useful — permanent personal block",
+      run: () => decideReview(props.entry, "block", "warning", "Memory blocked"),
+    };
+    const reportAction = {
+      label: "Report",
+      description: "Harmful or wrong — flag & escalate",
+      run: () => openReviewReport(props.entry),
+    };
+
+    const actions: Array<{ label: string; description: string; run: () => void }> = guardFlagged
+      ? [reportAction, denyAction, blockAction, acceptAction]
+      : [acceptAction, denyAction, blockAction, reportAction];
+
+    const selectActionByLabel = (label: string) => {
+      const index = actions.findIndex((action) => action.label === label);
+      if (index >= 0) {
+        setSelectedIndex(index);
+      }
+    };
 
     useKeyboard((evt: any) => {
       if (api.route.current?.name !== REVIEW_ROUTE) return;
@@ -640,28 +649,28 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
       if (name === "a") {
         evt.preventDefault?.();
         evt.stopPropagation?.();
-        setSelectedIndex(0);
+        selectActionByLabel("Accept");
         return;
       }
 
       if (name === "d") {
         evt.preventDefault?.();
         evt.stopPropagation?.();
-        setSelectedIndex(1);
+        selectActionByLabel("Deny");
         return;
       }
 
       if (name === "b") {
         evt.preventDefault?.();
         evt.stopPropagation?.();
-        setSelectedIndex(2);
+        selectActionByLabel("Block");
         return;
       }
 
       if (name === "r") {
         evt.preventDefault?.();
         evt.stopPropagation?.();
-        setSelectedIndex(3);
+        selectActionByLabel("Report");
       }
     });
 
