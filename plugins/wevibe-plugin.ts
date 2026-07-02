@@ -2,6 +2,7 @@ import { type Plugin } from "@opencode-ai/plugin"
 import { join, resolve, dirname } from "path"
 import { homedir } from "os"
 import { fileURLToPath } from "node:url"
+import { SessionMetricsRecorder } from "./metrics"
 
 interface CachedMemory {
   cid: string
@@ -345,6 +346,11 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const logDebug = (message: string): void => {
     if (process.env.WEVIBE_PLUGIN_DEBUG === "1") logPlugin("info", message)
   }
+
+  const metricsRecorder = new SessionMetricsRecorder({
+    runsDir: join(errorLogRoot, "runs"),
+    log: (message) => logDebug(message),
+  })
 
   const readQueue = (): PendingMemory[] => readJson<PendingMemory[]>(queuePath, [])
 
@@ -1127,6 +1133,14 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           eligible.map(m => `- ${m.text}`).join("\n")
         )
       }
+    },
+
+    event: async (input) => {
+      metricsRecorder.handleEvent(input.event)
+    },
+
+    "tool.execute.after": async (input, output) => {
+      metricsRecorder.handleToolAfter(input, output)
     },
   }
 }
