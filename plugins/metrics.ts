@@ -35,13 +35,15 @@ interface RecorderOptions {
 
 const sanitize = (s: string): string => s.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80)
 
-// --- bash-output classification (no exit code exists; parse the string) ------
+// --- bash-output classification (exit-code authoritative, head-anchored command parse) ------
 
 const COMMAND_PATTERNS: Array<{ category: CommandCategory; re: RegExp }> = [
-  // server first: `next dev` must not be mistaken for a build
-  { category: "server", re: /\b(next\s+dev|npm\s+(run\s+)?(dev|start)|yarn\s+(dev|start)|pnpm\s+(dev|start)|vite(\s|$)|nodemon)\b/i },
-  { category: "test", re: /\b(go\s+test|cargo\s+test|vitest|jest|playwright\s+test|npm\s+(run\s+)?test|pnpm\s+test|yarn\s+test|pytest)\b/i },
-  { category: "build", re: /\b(go\s+build|go\s+vet|cargo\s+(build|check)|tsc|next\s+build|npm\s+run\s+build|pnpm\s+build|yarn\s+build)\b/i },
+  // server first: `next dev` must not be mistaken for a build. Anchored at the
+  // start of a command segment so a mere mention (e.g. `git commit -m "fix vitest"`)
+  // never triggers a category — an unrecognized leading program => MISS, not a false.
+  { category: "server", re: /^\b(next\s+dev|npm\s+(run\s+)?(dev|start)|yarn\s+(dev|start)|pnpm\s+(dev|start)|vite(\s|$)|nodemon)\b/i },
+  { category: "test", re: /^\b(go\s+test|cargo\s+test|vitest|jest|playwright\s+test|npm\s+(run\s+)?test|pnpm\s+test|yarn\s+test|pytest)\b/i },
+  { category: "build", re: /^\b(go\s+build|go\s+vet|cargo\s+(build|check)|tsc|next\s+build|npm\s+run\s+build|pnpm\s+build|yarn\s+build)\b/i },
 ]
 
 const FAILURE_RE = /(error\s+TS\d+|error\[E?\d+\]|error:\s|could not compile|cannot find|undefined:|Failed to compile|Type error:|test result:\s*FAILED|--- FAIL|\bFAIL\b|panic:|EADDRINUSE|build failed|\d+\s+fail(ed|ing)\b|✗|✘)/i
@@ -50,18 +52,50 @@ const SUCCESS_RE = /(compiled successfully|✓\s*compiled|build succeeded|test r
 
 const SERVER_UP_RE = /(listening on|ready on|ready in\b|started server|server (started|listening|running)|Local:\s*https?:\/\/|running at|https?:\/\/localhost|✓ Ready)/i
 
+// A command is categorized by the PROGRAM ACTUALLY INVOKED at the head of a
+// segment — not by any word that merely appears in it. Split on shell separators,
+// strip leading env-assignments and known exec wrappers, then match COMMAND_PATTERNS
+// anchored at the segment start. Package-manager script forms (`yarn test`,
+// `pnpm build`, `npm run test`) match directly BEFORE any wrapper strip, so they
+// keep their category; a bare wrapper (`npx vitest`, `sudo go test`) is peeled to
+// expose the runner. Unknown leading program => null => the safe MISS (no record).
+const SEGMENT_SPLIT = /&&|\|\||;|\|/
+const ENV_ASSIGN = /^([A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/
+const WRAPPER_TWO: RegExp[] = [/^pnpm\s+exec\s+/i, /^pnpm\s+dlx\s+/i, /^bun\s+run\s+/i]
+const WRAPPER_ONE = /^(npx|yarn|bunx|sudo|time|env|command)\s+/i
+
+function categorize(command: string): CommandCategory | null {
+  for (const rawSeg of command.split(SEGMENT_SPLIT)) {
+    let seg = rawSeg.trim()
+    // Peel env-assignments + one wrapper token per pass; match at each level.
+    // Bounded (max 5 passes) so a pathological input can never loop.
+    for (let pass = 0; pass < 5 && seg; pass++) {
+      seg = seg.replace(ENV_ASSIGN, "").trimStart()
+      for (const p of COMMAND_PATTERNS) {
+        if (p.re.test(seg)) return p.category
+      }
+      let next = seg
+      for (const w of WRAPPER_TWO) {
+        const r = seg.replace(w, "")
+        if (r !== seg) {
+          next = r
+          break
+        }
+      }
+      if (next === seg) next = seg.replace(WRAPPER_ONE, "")
+      if (next === seg) break // no runner/wrapper at head → try next segment
+      seg = next.trimStart()
+    }
+  }
+  return null
+}
+
 function classify(
   command: string,
   output: string,
   exitCode: number | null | undefined,
 ): { category: CommandCategory | null; result: DetectResult } {
-  let category: CommandCategory | null = null
-  for (const p of COMMAND_PATTERNS) {
-    if (p.re.test(command)) {
-      category = p.category
-      break
-    }
-  }
+  const category = categorize(command)
   if (!category) return { category: null, result: "unknown" }
 
   const text = output.length > 40000 ? output.slice(0, 20000) + "\n" + output.slice(-20000) : output
@@ -76,13 +110,10 @@ function classify(
   // output.metadata.exit (a number on any normal exit incl. nonzero; null only on
   // abort/timeout). It is the authoritative pass/fail signal — and the only one that
   // works for a SILENT green build (`tsc --noEmit` / `go build ./...`), whose stdout
-  // opencode renders as the literal "(no output)" placeholder, so the text is never
-  // truly empty. (opencode 1.16 ShellTool.run.)
+  // opencode renders as the literal "(no output)" placeholder. Pure exit-code trust:
+  // exit 0 = success unqualified (no output recheck), any nonzero = failure.
   if (typeof exitCode === "number") {
-    if (exitCode !== 0) return { category, result: "failure" }
-    // exit 0 = success unless the output still shows an explicit failure.
-    if (FAILURE_RE.test(text)) return { category, result: "failure" }
-    return { category, result: "success" }
+    return { category, result: exitCode === 0 ? "success" : "failure" }
   }
 
   // Exit code unavailable (abort/timeout → null): fall back to text heuristics.
