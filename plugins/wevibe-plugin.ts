@@ -1,8 +1,9 @@
 import { type Plugin } from "@opencode-ai/plugin"
-import { join, resolve, dirname } from "path"
+import { join, resolve, dirname, basename } from "path"
 import { homedir } from "os"
 import { fileURLToPath } from "node:url"
 import { SessionMetricsRecorder } from "./metrics"
+import { buildRecallHarvest, type RecallHarvestSignals } from "./recall-harvest"
 
 interface CachedMemory {
   cid: string
@@ -624,6 +625,56 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   let memoryCacheKey = ""
   let memoryCacheTimestamp = 0
   const MEMORY_CACHE_TTL_MS = 5 * 60 * 1000  // 5 minutes
+  const KNOWN_FRAMEWORK_DEPENDENCIES = new Set<string>([
+    "react",
+    "next",
+    "vue",
+    "svelte",
+    "express",
+    "fastify",
+    "vitest",
+    "jest",
+    "playwright",
+    "django",
+    "flask",
+    "fastapi",
+    "axum",
+    "actix",
+  ])
+
+  const frameworkFromDependency = (dependencyName: string): string | undefined => {
+    const normalized = dependencyName.trim().toLowerCase()
+    if (normalized.length === 0) return undefined
+    if (normalized === "@playwright/test") return "playwright"
+    return KNOWN_FRAMEWORK_DEPENDENCIES.has(normalized) ? normalized : undefined
+  }
+
+  let harvestProjectContext: {
+    language?: string
+    deps: string[]
+    frameworks: string[]
+    stack: string[]
+    projectName?: string
+    directory?: string
+  } = {
+    deps: [],
+    frameworks: [],
+    stack: [],
+  }
+
+  const relativizeToWorktree = (filePath: string): string => {
+    const trimmedPath = typeof filePath === "string" ? filePath.trim() : ""
+    if (trimmedPath.length === 0) {
+      return ""
+    }
+
+    const worktreePrefix = worktree.endsWith("/") ? worktree : `${worktree}/`
+    if (worktree.length > 1 && trimmedPath.startsWith(worktreePrefix)) {
+      return trimmedPath.slice(worktreePrefix.length).replace(/^\/+/, "")
+    }
+
+    return basename(trimmedPath)
+  }
 
   if (!resolvedWeVibeRoot) {
     logPlugin("warn", `resolve warning: wevibe-mcp not found relative to worktree=${worktree}, directory=${directory}`)
@@ -798,11 +849,35 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         return
       }
       const { relevanceFloor, maxInjected, recallLimit } = getRecallGovernorConfig()
+      const sessionId = currentSessionId()
+      const editedFilesAbs = metricsRecorder.getEditedFiles(sessionId)
+      const editedFiles = editedFilesAbs
+        .map(filePath => relativizeToWorktree(filePath))
+        .filter(filePath => filePath.length > 0)
+      const harvestSignals: RecallHarvestSignals = {
+        prompt: query,
+        language: harvestProjectContext.language,
+        deps: harvestProjectContext.deps,
+        frameworks: harvestProjectContext.frameworks,
+        stack: harvestProjectContext.stack,
+        projectName: harvestProjectContext.projectName,
+        directory: harvestProjectContext.directory,
+        errorStrings: metricsRecorder.getRecentErrors(sessionId),
+        editedFiles,
+      }
+      const harvestFields = buildRecallHarvest(harvestSignals)
       logPlugin("info", `[recall] loadMemories request=POST /v1/recall limit=${recallLimit}`)
       const res = await fetch(`${WEVIBE_MCP_HTTP}/v1/recall`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ query, limit: recallLimit, session_id: currentSessionId(), relevance_floor: relevanceFloor, surface_budget: maxInjected }),
+        body: JSON.stringify({
+          query,
+          ...harvestFields,
+          limit: recallLimit,
+          session_id: sessionId,
+          relevance_floor: relevanceFloor,
+          surface_budget: maxInjected,
+        }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       })
       logPlugin("info", `[recall] loadMemories response status=${res.status}`)
@@ -990,17 +1065,60 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const contextParts: string[] = []
   const isValidWorktree = typeof worktree === "string" && worktree.length > 1 && worktree !== "/" && existsSync(worktree)
   try {
+    const projectDeps: string[] = []
+    const projectFrameworks: string[] = []
+    const projectStack: string[] = []
+    let projectLanguage: string | undefined
+    let projectName: string | undefined
+    let projectDirectory: string | undefined
+    const addUnique = (target: string[], value: string): void => {
+      if (!target.includes(value)) {
+        target.push(value)
+      }
+    }
+
     const pkgPath = join(worktree, "package.json")
     if (isValidWorktree && existsSync(pkgPath)) {
-      const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"))
-      if (pkg.name) contextParts.push(pkg.name)
-      if (pkg.dependencies) contextParts.push(...Object.keys(pkg.dependencies).slice(0, 10))
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf-8")) as {
+        name?: unknown
+        dependencies?: Record<string, unknown>
+      }
+      if (typeof pkg.name === "string" && pkg.name.length > 0) {
+        contextParts.push(pkg.name)
+      }
+
+      const dependencyNames =
+        pkg.dependencies && typeof pkg.dependencies === "object"
+          ? Object.keys(pkg.dependencies)
+          : []
+      if (dependencyNames.length > 0) {
+        contextParts.push(...dependencyNames.slice(0, 10))
+        for (const dependencyName of dependencyNames.slice(0, 20)) {
+          addUnique(projectDeps, dependencyName)
+        }
+        for (const dependencyName of dependencyNames) {
+          const framework = frameworkFromDependency(dependencyName)
+          if (framework) {
+            addUnique(projectFrameworks, framework)
+          }
+        }
+      }
+
+      addUnique(projectStack, "Node.js")
+      addUnique(projectStack, "TypeScript")
+      if (!projectLanguage) {
+        projectLanguage = "TypeScript"
+      }
     }
     const goModPath = join(worktree, "go.mod")
     if (isValidWorktree && existsSync(goModPath)) {
       const goMod = readFileSync(goModPath, "utf-8")
       const moduleLine = goMod.split("\n").find(l => l.startsWith("module "))
       if (moduleLine) contextParts.push(moduleLine.replace("module ", "").trim())
+      addUnique(projectStack, "Go")
+      if (!projectLanguage) {
+        projectLanguage = "Go"
+      }
     }
     const cargoPath = join(worktree, "Cargo.toml")
     if (isValidWorktree && existsSync(cargoPath)) {
@@ -1010,9 +1128,26 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         const name = nameLine.split("=")[1]?.trim().replace(/"/g, "")
         if (name) contextParts.push(name)
       }
+      addUnique(projectStack, "Rust")
+      if (!projectLanguage) {
+        projectLanguage = "Rust"
+      }
     }
-    const { basename } = await import("path")
-    if (isValidWorktree) { contextParts.push(basename(worktree)) }
+    if (isValidWorktree) {
+      const worktreeBasename = basename(worktree)
+      contextParts.push(worktreeBasename)
+      projectName = worktreeBasename
+      projectDirectory = worktreeBasename
+    }
+
+    harvestProjectContext = {
+      language: projectLanguage,
+      deps: projectDeps,
+      frameworks: projectFrameworks,
+      stack: projectStack,
+      projectName,
+      directory: projectDirectory,
+    }
   } catch {
     // Context gathering is best-effort
   }

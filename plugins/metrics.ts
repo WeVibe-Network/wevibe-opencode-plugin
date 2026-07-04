@@ -26,6 +26,8 @@ interface SessionState {
   serverStart: boolean
   errorCount: number
   erroredCallIDs: Set<string>
+  recentErrors: string[]
+  editedFiles: string[]
 }
 
 interface RecorderOptions {
@@ -34,6 +36,18 @@ interface RecorderOptions {
 }
 
 const sanitize = (s: string): string => s.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80)
+const MAX_RECENT_ERRORS = 8
+const MAX_EDITED_FILES = 15
+const MAX_SIGNAL_CHARS = 300
+
+const sanitizeSignal = (s: string): string => {
+  const newlineToken = sanitize("\n").slice(0, 1) || "_"
+  return s
+    .replace(/\r?\n+/g, ` ${newlineToken} `)
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_SIGNAL_CHARS)
+}
 
 // --- bash-output classification (exit-code authoritative, head-anchored command parse) ------
 
@@ -134,6 +148,38 @@ export class SessionMetricsRecorder {
     this.log = options.log ?? (() => {})
   }
 
+  private pushRecentError(s: SessionState, text: string): void {
+    const value = sanitizeSignal(text)
+    if (!value) return
+    s.recentErrors.push(value)
+    if (s.recentErrors.length > MAX_RECENT_ERRORS) {
+      s.recentErrors.splice(0, s.recentErrors.length - MAX_RECENT_ERRORS)
+    }
+  }
+
+  private pushEditedFile(s: SessionState, filePath: string): void {
+    const value = filePath.trim()
+    if (!value) return
+    const existing = s.editedFiles.indexOf(value)
+    if (existing >= 0) s.editedFiles.splice(existing, 1)
+    s.editedFiles.push(value)
+    if (s.editedFiles.length > MAX_EDITED_FILES) {
+      s.editedFiles.splice(0, s.editedFiles.length - MAX_EDITED_FILES)
+    }
+  }
+
+  private pickErrorText(value: unknown): string {
+    if (typeof value === "string") return value
+    if (value instanceof Error) return value.message
+    if (value && typeof value === "object") {
+      const record = value as Record<string, unknown>
+      if (typeof record.message === "string") return record.message
+      if (typeof record.error === "string") return record.error
+      if (typeof record.details === "string") return record.details
+    }
+    return ""
+  }
+
   private state(sessionID: string): SessionState {
     let s = this.sessions.get(sessionID)
     if (!s) {
@@ -150,6 +196,8 @@ export class SessionMetricsRecorder {
         serverStart: false,
         errorCount: 0,
         erroredCallIDs: new Set<string>(),
+        recentErrors: [],
+        editedFiles: [],
       }
       this.sessions.set(sessionID, s)
     }
@@ -186,6 +234,16 @@ export class SessionMetricsRecorder {
     }
   }
 
+  getRecentErrors(sessionID: string): string[] {
+    const s = this.sessions.get(sessionID)
+    return s ? [...s.recentErrors] : []
+  }
+
+  getEditedFiles(sessionID: string): string[] {
+    const s = this.sessions.get(sessionID)
+    return s ? [...s.editedFiles] : []
+  }
+
   handleEvent(event: Event): void {
     try {
       // Cheap type filter FIRST: the event firehose fires very frequently.
@@ -201,6 +259,8 @@ export class SessionMetricsRecorder {
           if (!sid) return
           const s = this.state(sid)
           s.errorCount += 1
+          const errorText = this.pickErrorText(event.properties)
+          if (errorText) this.pushRecentError(s, errorText)
           this.snapshot(s, "session.error")
           break
         }
@@ -212,6 +272,9 @@ export class SessionMetricsRecorder {
           if (s.erroredCallIDs.has(part.callID)) return
           s.erroredCallIDs.add(part.callID)
           s.errorCount += 1
+          const partState = part.state as { error?: unknown; message?: unknown } | null | undefined
+          const errorText = this.pickErrorText(partState?.error) || this.pickErrorText(partState?.message)
+          if (errorText) this.pushRecentError(s, errorText)
           this.snapshot(s, "tool.error")
           break
         }
@@ -228,6 +291,17 @@ export class SessionMetricsRecorder {
     output: { output: string; metadata?: { exit?: number | null } },
   ): void {
     try {
+      const tool = input.tool.toLowerCase()
+      const argsRecord = input.args && typeof input.args === "object" ? (input.args as Record<string, unknown>) : null
+      const filePath = typeof argsRecord?.filePath === "string" ? argsRecord.filePath : typeof argsRecord?.path === "string" ? argsRecord.path : ""
+      const looksLikeFileTouch = tool.includes("edit") || tool.includes("write") || tool.includes("patch") || filePath.length > 0
+
+      let s: SessionState | null = null
+      if (looksLikeFileTouch && filePath) {
+        s = this.state(input.sessionID)
+        this.pushEditedFile(s, filePath)
+      }
+
       if (input.tool !== "bash") return
       const args = input.args as { command?: unknown } | null | undefined
       const command = typeof args?.command === "string" ? args.command : ""
@@ -235,7 +309,12 @@ export class SessionMetricsRecorder {
       const exitCode = typeof output.metadata?.exit === "number" ? output.metadata.exit : null
       const { category, result } = classify(command, output.output ?? "", exitCode)
       if (!category) return
-      const s = this.state(input.sessionID)
+      if (!s) s = this.state(input.sessionID)
+      if (result === "failure") {
+        const outputSlice = (output.output ?? "").trim().slice(0, 180)
+        const summary = `${command.trim().slice(0, 100)} | exit=${exitCode === null ? "unknown" : String(exitCode)}${outputSlice ? ` | ${outputSlice}` : ""}`
+        this.pushRecentError(s, summary)
+      }
       if (category === "build") {
         if (result === "success") s.buildSuccess = true
         else if (result === "failure") s.buildSuccess = false
