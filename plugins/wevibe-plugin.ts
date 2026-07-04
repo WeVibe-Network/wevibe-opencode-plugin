@@ -53,6 +53,18 @@ interface RecallGovernorConfig {
   recallLimit: number
 }
 
+interface ServedMemoryRecord {
+  cid: string
+  text: string
+  session_ids: string[]
+  last_used_at: number
+}
+
+interface ServedMemoriesStore {
+  version: 1
+  memories: Record<string, ServedMemoryRecord>
+}
+
 export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, $ }) => {
   const fs = await import("node:fs")
   const { existsSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, statSync } = fs
@@ -62,6 +74,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const DECISIONS_FILENAME = "wevibe-plugin-decisions.json"
   const STATUS_FILENAME = "wevibe-plugin-status.json"
   const PLUGIN_CONFIG_PATH = join(homedir(), ".wevibe", "plugin-config.json")
+  const SERVED_MEMORIES_PATH =
+    process.env.WEVIBE_SERVED_MEMORIES_PATH ?? join(homedir(), ".wevibe", "served-memories.json")
   // Recall governor defaults are mode-driven via WEVIBE_RECALL_MODE.
   // prod (default): floor=0.55, budget=3, limit=3; test: floor=0, budget=1000, limit=1000.
   const PROD_RECALL_GOVERNOR_DEFAULTS = {
@@ -77,6 +91,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const RECALL_IN_FLIGHT_AWAIT_TIMEOUT_MS = 15_000
   const INJECT_GATE_POLL_INTERVAL_MS = 250
   const INJECT_GATE_TIMEOUT_MS = 300_000
+  const SERVED_MEMORIES_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 
   const readJson = <T>(filePath: string, fallback: T): T => {
     try {
@@ -106,6 +121,92 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       }
     } catch {
       // best-effort: never let state-file creation crash plugin load
+    }
+  }
+
+  const emptyServedMemoriesStore = (): ServedMemoriesStore => ({
+    version: 1,
+    memories: {},
+  })
+
+  const SERVED_MEMORIES_DEFAULT_FILE = '{\n  "version": 1,\n  "memories": {}\n}\n'
+
+  const upsertServedMemories = (records: { cid: string; text: string }[], sid: string): void => {
+    try {
+      if (records.length === 0 || sid.length === 0) {
+        return
+      }
+
+      ensureFile(SERVED_MEMORIES_PATH, SERVED_MEMORIES_DEFAULT_FILE)
+      const store = readJson<ServedMemoriesStore>(SERVED_MEMORIES_PATH, emptyServedMemoriesStore())
+      const memories =
+        store && typeof store === "object" && store.memories && typeof store.memories === "object" && !Array.isArray(store.memories)
+          ? { ...store.memories }
+          : {}
+      const now = Date.now()
+
+      for (const record of records) {
+        if (!record || record.cid.length === 0) {
+          continue
+        }
+
+        const existing = memories[record.cid]
+        if (!existing) {
+          memories[record.cid] = {
+            cid: record.cid,
+            text: record.text,
+            session_ids: [sid],
+            last_used_at: now,
+          }
+          continue
+        }
+
+        const sessionIds = Array.isArray(existing.session_ids)
+          ? existing.session_ids.filter(candidate => typeof candidate === "string" && candidate.length > 0)
+          : []
+        if (!sessionIds.includes(sid)) {
+          sessionIds.push(sid)
+        }
+
+        memories[record.cid] = {
+          cid: record.cid,
+          text: record.text,
+          session_ids: sessionIds,
+          last_used_at: now,
+        }
+      }
+
+      writeJson(SERVED_MEMORIES_PATH, {
+        version: 1,
+        memories,
+      })
+    } catch {
+      // best-effort: never let served-memory persistence crash plugin flow
+    }
+  }
+
+  const gcServedMemories = (): void => {
+    try {
+      ensureFile(SERVED_MEMORIES_PATH, SERVED_MEMORIES_DEFAULT_FILE)
+      const store = readJson<ServedMemoriesStore>(SERVED_MEMORIES_PATH, emptyServedMemoriesStore())
+      const memories =
+        store && typeof store === "object" && store.memories && typeof store.memories === "object" && !Array.isArray(store.memories)
+          ? { ...store.memories }
+          : {}
+      const cutoff = Date.now() - SERVED_MEMORIES_RETENTION_MS
+
+      for (const [cid, memory] of Object.entries(memories)) {
+        if (typeof memory.last_used_at === "number" && memory.last_used_at < cutoff) {
+          delete memories[cid]
+        }
+      }
+
+      writeJson(SERVED_MEMORIES_PATH, {
+        version: 1,
+        memories,
+      })
+    } catch {
+      // best-effort: never let served-memory GC crash plugin flow
     }
   }
 
@@ -926,6 +1027,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         logPlugin("warn", "TEST MODE — recall governor bypassed (floor=0 budget=1000 limit=1000)")
       }
       wevibeAvailable = await ensureWeVibeMcpRunning()
+      gcServedMemories()
       logPlugin("info", `[recall] init worktree=${worktree} dir=${directory} contextParts=${validContextParts.length} query="${queryToUse.slice(0,80)}"`)
       logPlugin("info", `[recall] init wevibeAvailable=${wevibeAvailable}`)
       if (wevibeAvailable) {
@@ -1123,6 +1225,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           }).catch(() => {})
         }
       }
+      upsertServedMemories(newlyServed.map(m => ({ cid: m.cid, text: m.text })), sid)
     },
 
     "experimental.session.compacting": async (input, output) => {
