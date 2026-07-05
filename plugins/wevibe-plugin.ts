@@ -1300,8 +1300,6 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     // Context gathering is best-effort
   }
 
-  const validContextParts = contextParts.filter(p => p && p.trim().length > 0)
-  const queryToUse = validContextParts.length > 0 ? validContextParts.join(" ") : "project coding standards conventions best practices"
   void (async () => {
     try {
       const recallMode = getRecallMode()
@@ -1311,11 +1309,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       }
       wevibeAvailable = await ensureWeVibeMcpRunning()
       gcServedMemories()
-      logPlugin("info", `[recall] init worktree=${worktree} dir=${directory} contextParts=${validContextParts.length} query="${queryToUse.slice(0,80)}"`)
+      logPlugin("info", `[recall] init worktree=${worktree} dir=${directory} contextParts=${contextParts.length}`)
       logPlugin("info", `[recall] init wevibeAvailable=${wevibeAvailable}`)
-      if (wevibeAvailable) {
-        await loadMemories(queryToUse, newTrace())
-      }
     } catch (e) {
       logPlugin("error", `[recall] background init failed: ${e instanceof Error ? e.message : String(e)}`)
     }
