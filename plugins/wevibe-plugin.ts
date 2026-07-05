@@ -351,7 +351,91 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     return undefined
   }
 
+  const safeExists = (filePath: string): boolean => {
+    try {
+      return existsSync(filePath)
+    } catch {
+      return false
+    }
+  }
+
+  const safeIsDirectory = (filePath: string): boolean => {
+    try {
+      return statSync(filePath).isDirectory()
+    } catch {
+      return false
+    }
+  }
+
+  const findWorkspaceMetaLogDir = (startDir: string): string | undefined => {
+    let current: string
+    try {
+      current = resolve(startDir)
+    } catch {
+      return undefined
+    }
+
+    while (true) {
+      const metaDir = join(current, "wevibe-meta")
+      if (safeExists(metaDir) && safeIsDirectory(metaDir)) {
+        return join(metaDir, ".logs")
+      }
+
+      const parent = dirname(current)
+      if (parent === current) {
+        return undefined
+      }
+      current = parent
+    }
+  }
+
   const resolvedWeVibeRoot = findWeVibeRoot()
+
+  const resolveMetaLogDir = (): string => {
+    const envLogDir = process.env.WEVIBE_LOG_DIR
+    if (typeof envLogDir === "string" && envLogDir.trim() !== "") {
+      return envLogDir
+    }
+
+    const candidates = new Set<string>()
+    const pushCandidate = (value: string | undefined | null): void => {
+      if (typeof value !== "string" || value.trim() === "") {
+        return
+      }
+      candidates.add(value)
+    }
+
+    try {
+      pushCandidate(process.cwd())
+    } catch {
+      // best-effort cwd lookup
+    }
+
+    try {
+      const pluginFile = fileURLToPath(import.meta.url)
+      pushCandidate(dirname(pluginFile))
+    } catch {
+      // best-effort plugin self-location
+    }
+
+    pushCandidate(resolvedWeVibeRoot)
+    pushCandidate(worktree)
+    pushCandidate(directory)
+
+    for (const startDir of candidates) {
+      const discovered = findWorkspaceMetaLogDir(startDir)
+      if (discovered) {
+        return discovered
+      }
+    }
+
+    try {
+      return join(homedir(), ".wevibe", "logs")
+    } catch {
+      return join(".wevibe", "logs")
+    }
+  }
+
   const wevibeRoot = resolvedWeVibeRoot ?? worktree
 
   const isUsableDir = (p: string | undefined | null): p is string =>
@@ -365,7 +449,13 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   // mkdir('/.opencode') EROFS crashes that would fail the whole plugin load.
   const writableFallback = join(homedir(), ".wevibe")
   const errorLogRoot = safeWorktree ?? safeDirectory ?? safeCwd ?? resolvedWeVibeRoot ?? writableFallback
-  const errorLogPath = join(errorLogRoot, "wevibe-plugin-errors.log")
+  const metaLogDir = resolveMetaLogDir()
+  const errorLogPath = join(metaLogDir, "wevibe-plugin-errors.log")
+  try {
+    mkdirSync(metaLogDir, { recursive: true })
+  } catch {
+    // best-effort logging only
+  }
 
   const stateRoot = safeWorktree ?? safeDirectory ?? safeCwd ?? writableFallback
   const stateDir = join(stateRoot, STATE_DIRNAME)
@@ -821,7 +911,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       // Use a real node: process.execPath when it is node, else "node" resolved
       // via PATH (the spawn env below inherits process.env.PATH).
       const nodeBin = /[\\/]node$/.test(process.execPath) ? process.execPath : "node"
-      const mcpLogDir = join(errorLogRoot, ".logs")
+      const mcpLogDir = metaLogDir
       const mcpLogPath = join(mcpLogDir, "host-mcp-4450.log")
       const spawnTrace = newTrace()
       spawnTraceForFailure = spawnTrace
