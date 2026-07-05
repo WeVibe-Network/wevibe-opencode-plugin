@@ -2,6 +2,7 @@ import { type Plugin } from "@opencode-ai/plugin"
 import { join, resolve, dirname, basename } from "path"
 import { homedir } from "os"
 import { fileURLToPath } from "node:url"
+import { createHash, randomUUID } from "node:crypto"
 import { SessionMetricsRecorder } from "./metrics"
 import { buildRecallHarvest, type RecallHarvestSignals } from "./recall-harvest"
 
@@ -67,8 +68,9 @@ interface ServedMemoriesStore {
 }
 
 export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, $ }) => {
+  const initTs = Date.now()
   const fs = await import("node:fs")
-  const { existsSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, statSync } = fs
+  const { existsSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, statSync, openSync, closeSync } = fs
 
   const STATE_DIRNAME = ".opencode"
   const QUEUE_FILENAME = "wevibe-plugin-queue.json"
@@ -424,8 +426,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const hubUrl = process.env.WEVIBE_HUB_URL
   const orgId = process.env.WEVIBE_ORG_ID
 
-  function logPlugin(level: "info" | "warn" | "error", message: string): void {
-    const line = `[${level}] ${message}`
+  function logPlugin(level: "info" | "warn" | "error", message: string, trace?: string): void {
+    const line = `${new Date().toISOString()} [${level}]${trace ? ` trace=${trace}` : ""} ${message}`
     try {
       appendFileSync(errorLogPath, `${line}\n`)
     } catch {
@@ -441,9 +443,28 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       }).catch(() => undefined)
     }
     if (process.env.WEVIBE_PLUGIN_DEBUG === "1") {
-      console.error(`wevibe(${level}): ${message}`)
+      console.error(`wevibe(${level}): ${line}`)
     }
   }
+
+  const newTrace = (): string => {
+    try {
+      return randomUUID().slice(0, 8)
+    } catch {
+      return Math.random().toString(16).slice(2, 10)
+    }
+  }
+
+  const fp = (v: string | undefined): string => {
+    if (!v) return "none"
+    try {
+      return createHash("sha256").update(v).digest("hex").slice(0, 8)
+    } catch {
+      return "err"
+    }
+  }
+
+  logPlugin("info", `plugin init: dir=${directory} worktree=${worktree ?? "none"} logRoot=${errorLogRoot} initTs=${initTs}`)
 
   const logDebug = (message: string): void => {
     if (process.env.WEVIBE_PLUGIN_DEBUG === "1") logPlugin("info", message)
@@ -723,14 +744,24 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         }
 
         logPlugin("info", "restarting stale-dist wevibe-mcp daemon")
+        const restartTrace = newTrace()
+        const shutdownHeaders: Record<string, string> = {
+          ...headers,
+          "X-WeVibe-Trace-Id": restartTrace,
+        }
+        logPlugin("info", "mcp-4450 /v1/shutdown attempt (stale-dist restart)", restartTrace)
         try {
           await fetch(`${WEVIBE_MCP_HTTP}/v1/shutdown`, {
             method: "POST",
-            headers,
+            headers: shutdownHeaders,
             signal: AbortSignal.timeout(2000),
           })
-        } catch {
-          // best-effort shutdown before auto-start
+        } catch (err) {
+          logPlugin(
+            "warn",
+            `mcp-4450 /v1/shutdown best-effort failed: ${err instanceof Error ? err.message : String(err)}`,
+            restartTrace,
+          )
         }
 
         for (let attempt = 0; attempt < 10; attempt++) {
@@ -752,6 +783,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       // not running — attempt auto-start
     }
 
+    let spawnTraceForFailure = newTrace()
     try {
       const { spawn } = await import("child_process")
       const wevibeMcpBin = join(wevibeRoot, "wevibe-mcp/dist/server.js")
@@ -789,12 +821,30 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       // Use a real node: process.execPath when it is node, else "node" resolved
       // via PATH (the spawn env below inherits process.env.PATH).
       const nodeBin = /[\\/]node$/.test(process.execPath) ? process.execPath : "node"
+      const mcpLogDir = join(errorLogRoot, ".logs")
+      const mcpLogPath = join(mcpLogDir, "host-mcp-4450.log")
+      const spawnTrace = newTrace()
+      spawnTraceForFailure = spawnTrace
+      let mcpLogFd: number | undefined
+      try {
+        mkdirSync(mcpLogDir, { recursive: true })
+        mcpLogFd = openSync(mcpLogPath, "a")
+      } catch (err) {
+        logPlugin("warn", `mcp-4450 spawn: could not open ${mcpLogPath} for capture: ${err instanceof Error ? err.message : String(err)}`, spawnTrace)
+      }
+      const stdio: ("ignore" | number)[] = ["ignore", mcpLogFd ?? "ignore", mcpLogFd ?? "ignore"]
       const child = spawn(nodeBin, [wevibeMcpBin], {
         detached: true,
-        stdio: "ignore",
+        stdio,
         env,
       })
       child.unref()
+      if (mcpLogFd !== undefined) { try { closeSync(mcpLogFd) } catch { /* child holds its own inherited fd */ } }
+      logPlugin(
+        "info",
+        `mcp-4450 auto-start: bin=${wevibeMcpBin} pid=${child.pid} capture=${mcpLogFd !== undefined ? mcpLogPath : "FAILED"} hub=${env.WEVIBE_HUB_URL} org_fp=${fp(process.env.WEVIBE_ORG_ID)} epoch_fp=${fp(process.env.WEVIBE_EPOCH)} agentkey_fp=${fp(process.env.WEVIBE_AGENT_KEY ?? process.env.WEVIBE_AGENT_PRIVATE_KEY)}`,
+        spawnTrace,
+      )
 
       for (let attempt = 0; attempt < 10; attempt++) {
         await new Promise(resolve => setTimeout(resolve, 500))
@@ -809,18 +859,20 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         } catch {
           // still waiting
         }
+      }
+    } catch (e) {
+      const errorMessage = e instanceof Error ? e.message : String(e)
+      console.error("[wevibe-plugin] wevibe-mcp auto-start failed:", errorMessage)
+      logPlugin("error", `mcp-4450 auto-start failed: ${errorMessage}`, spawnTraceForFailure)
     }
-  } catch (e) {
-    console.error("[wevibe-plugin] wevibe-mcp auto-start failed:", e instanceof Error ? e.message : String(e))
+
+    const manualStartDir = join(wevibeRoot, "wevibe-mcp")
+    console.error(`[wevibe-plugin] Could not start wevibe-mcp. Run: cd ${manualStartDir} && npx tsx src/server.ts`)
+    return false
   }
 
-  const manualStartDir = join(wevibeRoot, "wevibe-mcp")
-  console.error(`[wevibe-plugin] Could not start wevibe-mcp. Run: cd ${manualStartDir} && npx tsx src/server.ts`)
-  return false
-}
-
-  async function loadMemories(query: string): Promise<void> {
-    logPlugin("info", `[recall] loadMemories query="${query.slice(0, 80)}"`)
+  async function loadMemories(query: string, trace: string): Promise<void> {
+    logPlugin("info", `[recall] loadMemories query="${query.slice(0, 80)}"`, trace)
     let recallOutcomeLogged = false
     const logRecallOutcome = (
       status: number | "none",
@@ -832,18 +884,18 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       recallOutcomeLogged = true
       const reason = typeof reasonCode === "string" && reasonCode.length > 0 ? reasonCode : "none"
       const error = typeof errorValue === "string" && errorValue.length > 0 ? errorValue : "none"
-      logPlugin("info", `recall: status=${status} count=${count} reason=${reason} error=${error}`)
+      logPlugin("info", `recall: status=${status} count=${count} reason=${reason} error=${error}`, trace)
     }
 
     try {
       const now = Date.now()
       if (query === memoryCacheKey && cachedMemories.length > 0 && (now - memoryCacheTimestamp) < MEMORY_CACHE_TTL_MS) {
-        logPlugin("info", `[recall] loadMemories cache-hit ageSec=${Math.round((now - memoryCacheTimestamp) / 1000)} query="${query.slice(0, 80)}"`)
+        logPlugin("info", `[recall] loadMemories cache-hit ageSec=${Math.round((now - memoryCacheTimestamp) / 1000)} query="${query.slice(0, 80)}"`, trace)
         return
       }
 
       const token = readWeVibeMcpToken()
-      logPlugin("info", `[recall] loadMemories tokenPresent=${Boolean(token)}`)
+      logPlugin("info", `[recall] loadMemories tokenPresent=${Boolean(token)}`, trace)
       if (!token) {
         logRecallOutcome("none", 0, "token_missing")
         return
@@ -866,10 +918,15 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         editedFiles,
       }
       const harvestFields = buildRecallHarvest(harvestSignals)
-      logPlugin("info", `[recall] loadMemories request=POST /v1/recall limit=${recallLimit}`)
+      logPlugin("info", `[recall] harvest fields=${Object.keys(harvestFields).length}`, trace)
+      logPlugin("info", `[recall] loadMemories request=POST /v1/recall limit=${recallLimit}`, trace)
       const res = await fetch(`${WEVIBE_MCP_HTTP}/v1/recall`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+          'X-WeVibe-Trace-Id': trace,
+        },
         body: JSON.stringify({
           query,
           ...harvestFields,
@@ -880,7 +937,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         }),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       })
-      logPlugin("info", `[recall] loadMemories response status=${res.status}`)
+      logPlugin("info", `[recall] loadMemories response status=${res.status}`, trace)
 
       if (!res.ok) {
         let reasonCode: string | undefined
@@ -1059,7 +1116,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const triggerRecall = (query: string): void => {
     if (!wevibeAvailable) return
     if (recallInFlight) return
-    recallInFlight = loadMemories(query).catch(() => undefined).finally(() => { recallInFlight = null })
+    const trace = newTrace()
+    recallInFlight = loadMemories(query, trace).catch(() => undefined).finally(() => { recallInFlight = null })
   }
 
   const contextParts: string[] = []
@@ -1166,7 +1224,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       logPlugin("info", `[recall] init worktree=${worktree} dir=${directory} contextParts=${validContextParts.length} query="${queryToUse.slice(0,80)}"`)
       logPlugin("info", `[recall] init wevibeAvailable=${wevibeAvailable}`)
       if (wevibeAvailable) {
-        await loadMemories(queryToUse)
+        await loadMemories(queryToUse, newTrace())
       }
     } catch (e) {
       logPlugin("error", `[recall] background init failed: ${e instanceof Error ? e.message : String(e)}`)
@@ -1303,6 +1361,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       const sid = currentSessionId()
       const injectedSet = getSessionInjected(sid)
       const newlyServed = eligible.filter(m => !injectedSet.has(m.cid))
+      const injectTrace = newTrace()
+      logPlugin("info", `[inject] start sid=${sid} eligible=${eligible.length}`, injectTrace)
 
       const memoryBlock = [
         "",
@@ -1320,12 +1380,14 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       ].join("\n")
 
       output.system.push(memoryBlock)
+      logPlugin("info", `[inject] injected count=${eligible.length} chars=${memoryBlock.length} sid=${sid} newly_served=${newlyServed.length}`, injectTrace)
       logPlugin(
         "info",
         `[inject] ${new Date().toISOString()} sid=${sid} present_this_turn=${eligible.length} newly_served=${newlyServed.length}: ` +
           eligible
             .map(m => `${m.cid.slice(0, 12)}(score=${m.score.toFixed(3)}, "${m.text.slice(0, 60).replace(/\s+/g, " ")}")`)
             .join(" | "),
+        injectTrace,
       )
 
       if (getRecallMode() === "test" && newlyServed.length > 0) {
@@ -1343,11 +1405,14 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         injectedSet.add(mem.cid)
         const token = readWeVibeMcpToken()
         if (token && orgId) {
+          const serveTrace = newTrace()
+          logPlugin("info", `[serve] upsert cid=${mem.cid} sid=${sid}`, serveTrace)
           fetch(`${WEVIBE_MCP_HTTP}/v1/serves`, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
               "Authorization": `Bearer ${token}`,
+              "X-WeVibe-Trace-Id": serveTrace,
             },
             body: JSON.stringify({
               org_id: orgId,
@@ -1364,6 +1429,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     },
 
     "experimental.session.compacting": async (input, output) => {
+      logPlugin("info", `[lifecycle] compacting sid=${input?.sessionID ?? currentSessionId()}`, newTrace())
       const eligible = cachedMemories.filter(m => !m.blocked && approvedCids.has(m.cid))
       if (eligible.length > 0) {
         output.context.push(
@@ -1375,6 +1441,13 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 
     event: async (input) => {
       metricsRecorder.handleEvent(input.event)
+      const eventType = (input.event as { type?: unknown } | undefined)?.type
+      if (typeof eventType === "string") {
+        const lower = eventType.toLowerCase()
+        if (lower.includes("session") || lower.includes("idle") || lower.includes("exit")) {
+          logPlugin("info", `[lifecycle] event type=${eventType}`, newTrace())
+        }
+      }
     },
 
     "tool.execute.after": async (input, output) => {
