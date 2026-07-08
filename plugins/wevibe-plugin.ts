@@ -485,6 +485,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   }
 
   const refreshBindingState = (): void => {
+    // HARD-GATE (Walter 2026-07-08): binding is decided SOLELY by the OpenCode
+    // session SPAWN-ROOT worktree marker — `worktree` is that root; no subdir/parent walk.
     void detectBinding(worktree)
       .then((s) => {
         bindingState = s
@@ -981,7 +983,6 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           query,
           ...harvestFields,
           org_id: bindingState.orgId,
-          project_fingerprint: bindingState.fingerprint,
           mc_version: 1,
           limit: recallLimit,
           session_id: sessionId,

@@ -45,7 +45,21 @@ const parseMarker = (raw: string, markerPath: string): BindingState => {
   }
 }
 
+/**
+ * HARD-GATE (Walter, 2026-07-08): binding is decided SOLELY by the `.wevibe`
+ * marker at the OpenCode session's SPAWN-ROOT (the worktree root OpenCode
+ * launched the TUI session into, passed here as `worktreeRoot`). This reads
+ * ONLY `${worktreeRoot}/.wevibe/org.json`, then falls back to
+ * `${worktreeRoot}/.wevibe/org.local.json`. It NEVER walks UP to a parent and
+ * NEVER descends INTO subdirectories: a `.wevibe` marker in a subdir (or a
+ * parent) is NOT trusted and MUST NOT activate the plugin — only the
+ * spawn-root marker counts. If the spawn-root is not directly bound (or
+ * `worktreeRoot` is empty/blank) the session stays DORMANT (zero network).
+ */
 export async function detectBinding(worktreeRoot: string): Promise<BindingState> {
+  if (!isNonEmptyString(worktreeRoot)) {
+    return inactive()
+  }
   try {
     const markerDir = join(worktreeRoot, ".wevibe")
     const orgMarkerPath = join(markerDir, "org.json")
