@@ -14,6 +14,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid";
 import { createSignal, Show } from "solid-js";
 
@@ -153,12 +154,9 @@ const riskColorForEntry = (entry: QueueEntry): RiskColor => {
   return "green";
 };
 
-const THRESHOLD = 3;
-const COOLDOWN_MS = 24 * 60 * 60 * 1000;
-const KV_COUNTED = "wevibe.counted";
-const KV_LAST_NUDGE_AT = "wevibe.lastNudgeAt";
-const KV_LAST_NUDGE_N = "wevibe.lastNudgeN";
 let endpointResolutionStarted = false;
+// Resets each opencode process -> once-per-session nudge for non-members.
+let orgJoinPromptedThisSession = false;
 
 async function locateAdmin(api: any, options: PluginOptions | undefined): Promise<AdminLoc> {
   const node = options?.node || process.execPath || "node";
@@ -181,14 +179,12 @@ async function locateAdmin(api: any, options: PluginOptions | undefined): Promis
   return { node, script: null, bin: "wevibe-admin" };
 }
 
-function runAdmin(loc: AdminLoc, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+function runCli(file: string, argv: string[], cwd?: string): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const file = loc.script ? loc.node : loc.bin;
-    const argv = loc.script ? [loc.script, ...args] : args;
     let out = "";
     let err = "";
     try {
-      const child = spawn(file, argv, { stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn(file, argv, { cwd, stdio: ["ignore", "pipe", "pipe"] });
       child.stdout.on("data", (d) => (out += d.toString()));
       child.stderr.on("data", (d) => (err += d.toString()));
       child.on("error", (e) => resolve({ code: -1, stdout: out, stderr: String(e) }));
@@ -197,6 +193,24 @@ function runAdmin(loc: AdminLoc, args: string[]): Promise<{ code: number; stdout
       resolve({ code: -1, stdout: "", stderr: String(e) });
     }
   });
+}
+
+function runAdmin(loc: AdminLoc, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  const file = loc.script ? loc.node : loc.bin;
+  const argv = loc.script ? [loc.script, ...args] : args;
+  return runCli(file, argv);
+}
+
+function runBind(loc: AdminLoc, args: string[], cwd: string): Promise<{ code: number; stdout: string; stderr: string }> {
+  if (!loc.script) {
+    return Promise.resolve({
+      code: -1,
+      stdout: "",
+      stderr: "Could not locate wevibe bind CLI (admin script path unavailable).",
+    });
+  }
+  const bindScript = path.join(path.dirname(loc.script), "cli", "bind.js");
+  return runCli(loc.node, [bindScript, ...args], cwd);
 }
 
 function parseLastJson(s: string): any {
@@ -297,36 +311,61 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
     }
   };
 
-  const kvGet = <T,>(key: string, fallback: T): T => {
-    try {
-      return api.kv.get(key, fallback) as T;
-    } catch {
-      return fallback;
-    }
-  };
-  const kvSet = (key: string, value: unknown) => {
-    try {
-      api.kv.set(key, value);
-    } catch {
-      /* ignore */
-    }
-  };
-
   const isUsableDir = (p: unknown): p is string =>
     typeof p === "string" && p.length > 1 && p !== "/" && fs.existsSync(p);
   const wtWorktree = api?.state?.path?.worktree;
   const wtDirectory = api?.state?.path?.directory;
   const wtCwd = process.cwd();
-  const writableFallback = path.join(os.homedir(), ".wevibe");
-  const stateRoot =
+  const worktreeRoot =
     (isUsableDir(wtWorktree) ? wtWorktree : undefined) ??
     (isUsableDir(wtDirectory) ? wtDirectory : undefined) ??
-    (isUsableDir(wtCwd) ? wtCwd : undefined) ??
-    writableFallback;
-  const stateDir = path.join(stateRoot, ".opencode");
+    wtCwd;
+  const writableFallback = path.join(os.homedir(), ".wevibe");
+  // Bind-gated base dir — MUST stay byte-for-behavior identical to
+  // plugins/wevibe-paths.ts resolveScopedWeVibeDir. The TUI is raw-copied
+  // standalone and cannot import that module; drift is caught by
+  // plugins/tui-statedir-guard.test.ts. BOUND (<root>/.wevibe/org.json|org.local.json
+  // present) -> <root>/.wevibe; UNBOUND -> ~/.wevibe/unbound/<fp> where
+  // fp = sha256hex(realpath(root)) matching the bind CLI realpath fingerprint.
+  // The engine reads this stateDir's wevibe-tui-active.json heartbeat, so both
+  // sides must resolve it identically. See report
+  // 07-07-26-1028-tui-unbound-statedir-gate.md.
+  const isProjectBound = (root: string): boolean =>
+    fs.existsSync(path.join(root, ".wevibe", "org.json")) ||
+    fs.existsSync(path.join(root, ".wevibe", "org.local.json"));
+  const projectFingerprint = (root: string): string => {
+    let canonical = root;
+    try {
+      canonical = fs.realpathSync(root);
+    } catch {
+      /* path not resolvable -> hash the raw root; keeps a stable key. */
+    }
+    return createHash("sha256").update(canonical, "utf8").digest("hex");
+  };
+  const weVibeBase = !isUsableDir(worktreeRoot)
+    ? writableFallback
+    : isProjectBound(worktreeRoot)
+      ? path.join(worktreeRoot, ".wevibe")
+      : path.join(writableFallback, "unbound", projectFingerprint(worktreeRoot));
+  const stateDir = path.join(weVibeBase, "state");
+  const logDir =
+    typeof process.env.WEVIBE_LOG_DIR === "string" && process.env.WEVIBE_LOG_DIR.trim() !== ""
+      ? process.env.WEVIBE_LOG_DIR
+      : path.join(weVibeBase, "logs");
+  const pluginLogPath = path.join(logDir, "wevibe-plugin-errors.log");
   const queuePath = path.join(stateDir, "wevibe-plugin-queue.json");
   const decisionsPath = path.join(stateDir, "wevibe-plugin-decisions.json");
   const heartbeatPath = path.join(stateDir, "wevibe-tui-active.json");
+
+  const logPlugin = (level: "info" | "warn" | "error", message: string) => {
+    const line = `${new Date().toISOString()} [${level}] ${message}`;
+    try {
+      fs.mkdirSync(logDir, { recursive: true });
+      fs.appendFileSync(pluginLogPath, `${line}\n`, "utf8");
+    } catch {
+      /* best-effort logging only */
+    }
+  };
 
   const ensureStateDir = () => {
     try {
@@ -1108,15 +1147,18 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
   }
 
   const createIdentity = () => {
-    toast("info", "Creating your WeVibe identity — approve the Touch ID prompt…");
+    const createIdentityMessage =
+      process.platform === "darwin"
+        ? "Creating your WeVibe identity — approve the Touch ID prompt…"
+        : "Creating your WeVibe identity…";
+    toast("info", createIdentityMessage);
     runAdmin(loc, ["setup-identity", "--json"]).then((r) => {
       const res = parseLastJson(r.stdout);
       if (res?.status === "created") {
         alert(
           "WeVibe identity created \u2713\n\n" +
-            "That's step 1 (your local keypair). Next, open app.wevibe.network to " +
-            "join an org and become a contributor \u2014 contributing is how you earn " +
-            "reputation & rewards. Run /wevibe-connect when you're ready.",
+            "That's step 1 (your local keypair). Next, run /wevibe-bind to " +
+            "connect this project to your org.",
         );
       } else if (res?.status === "exists") {
         toast("info", "You already have a WeVibe identity.");
@@ -1128,8 +1170,53 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
     });
   };
 
+  const bindProject = () => {
+    toast("info", "Binding this project to your WeVibe org…");
+    runBind(loc, ["bind"], worktreeRoot)
+      .then((r) => {
+        const stdoutLines = r.stdout
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0);
+        const stderrTail = r.stderr
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0)
+          .slice(-2)
+          .join(" | ");
+        const stdoutTail = stdoutLines.slice(-2).join(" | ");
+
+        if (r.code !== 0) {
+          toast("error", `Bind failed: ${stderrTail || stdoutTail || "unknown error"}`, 9000);
+          return;
+        }
+
+        const existingMarkerLine = stdoutLines.find((line) => /^Marker already exists at\s+/i.test(line));
+        if (existingMarkerLine) {
+          toast("info", existingMarkerLine, 9000);
+          return;
+        }
+
+        const orgLine = stdoutLines.find((line) => /^Bound org:\s+/i.test(line));
+        const fingerprintLine = stdoutLines.find((line) => /^Fingerprint:\s+/i.test(line));
+        if (orgLine && fingerprintLine) {
+          const org = orgLine.replace(/^Bound org:\s+/i, "").trim();
+          const fingerprint = fingerprintLine.replace(/^Fingerprint:\s+/i, "").trim();
+          const shortFingerprint = fingerprint.length > 12 ? `${fingerprint.slice(0, 12)}…` : fingerprint;
+          toast("success", `Bound this project ✓ org ${org} · fp ${shortFingerprint}`, 9000);
+          return;
+        }
+
+        toast("success", stdoutLines[stdoutLines.length - 1] ?? "Bound this project ✓", 9000);
+      })
+      .catch((error) => {
+        const msg = error instanceof Error ? error.message : String(error);
+        toast("error", `Bind failed: ${msg}`, 9000);
+      });
+  };
+
   const openDashboard = () => {
-    toast("info", "Opening app.wevibe.network \u2014 join your org and contribute there\u2026");
+    toast("info", "Opening the WeVibe dashboard \u2014 join your org and contribute there\u2026");
     runAdmin(loc, ["export-pairing", "--open", "--json"]).then((r) => {
       const res = parseLastJson(r.stdout);
       if (res?.ok && res.opened) {
@@ -1151,12 +1238,18 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
   let identityPresent = false;
   let extracted = false;
   let adopted = false;
+  let hasKnownOrg = false;
+  let knownOrgCount = 0;
 
   const sc = readSidecar();
   if (sc?.ed25519PublicKey) {
     identityPresent = true;
     extracted = sc.extractedAt != null;
     adopted = sc.adoptedAt != null;
+    // Canonical gate logic lives in plugins/org-join-gate.ts; this standalone
+    // raw-copied TUI file cannot import it at runtime.
+    hasKnownOrg = !!sc.orgs && typeof sc.orgs === "object" && Object.keys(sc.orgs).length > 0;
+    knownOrgCount = !!sc.orgs && typeof sc.orgs === "object" ? Object.keys(sc.orgs).length : 0;
   } else {
     try {
       const status = await getStatus();
@@ -1178,60 +1271,33 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
       confirm(
         "No WeVibe identity detected.\n\n" +
           "Create your WeVibe identity now? This is step 1 (a local keypair). " +
-          "You'll then join an org and contribute on app.wevibe.network.",
+          "You'll then join an org and contribute on the WeVibe dashboard.",
         createIdentity,
       );
     }, 900);
   }
 
-  // --- Session-count nudge --------------------------------------------------
-  const counted = new Set<string>(kvGet<string[]>(KV_COUNTED, []));
-
-  const maybeNudge = () => {
-    if (!identityPresent || extracted) return;
-    if (coreDialogBusy()) return;
-    const n = counted.size;
-    if (n < THRESHOLD) return;
-    const now = Date.now();
-    const lastAt = kvGet<number>(KV_LAST_NUDGE_AT, 0);
-    const lastN = kvGet<number>(KV_LAST_NUDGE_N, 0);
-    if (now - lastAt < COOLDOWN_MS) return;
-    if (n <= lastN) return;
-    kvSet(KV_LAST_NUDGE_AT, now);
-    kvSet(KV_LAST_NUDGE_N, n);
-    confirm(
-      adopted
-        ? `You have ${n} coding sessions ready to contribute.\n\nOpen app.wevibe.network to contribute them?`
-        : `You have ${n} coding sessions WeVibe can turn into contributions.\n\n` +
-            `Open app.wevibe.network to join your org and start contributing? (Contributing is how you earn reputation & rewards.)`,
-      openDashboard,
-    );
-  };
-
-  const recordSession = (sessionID: unknown) => {
-    if (typeof sessionID !== "string" || !sessionID) return;
-    if (counted.has(sessionID)) return;
-    counted.add(sessionID);
-    kvSet(KV_COUNTED, [...counted]);
-    maybeNudge();
-  };
-
-  const extractSessionId = (e: any): unknown =>
-    e?.properties?.sessionID ?? e?.sessionID ?? e?.properties?.info?.id ?? e?.properties?.id;
-
-  // session.idle is deprecated in favor of session.status; listen to both, dedupe by id.
-  try {
-    api.event.on("session.idle", (e: any) => recordSession(extractSessionId(e)));
-  } catch {
-    /* ignore */
-  }
-  try {
-    api.event.on("session.status", (e: any) => {
-      const status = e?.properties?.status?.type ?? e?.properties?.status;
-      if (status === "idle" || status === undefined) recordSession(extractSessionId(e));
-    });
-  } catch {
-    /* ignore */
+  // --- Org-join prompt (adopted-aware, at most once) ------------------------
+  // First TUI session in a BOUND project where a local identity EXISTS but has
+  // not yet been dashboard-adopted and has no known org membership from the
+  // sidecar org map. Consolidates the org nudge into one prompt per opencode
+  // process for eligible non-members.
+  const isBoundProject = isProjectBound(worktreeRoot);
+  const shouldPromptOrgJoin =
+    identityPresent && !adopted && !hasKnownOrg && isProjectBound(worktreeRoot) && !orgJoinPromptedThisSession;
+  logPlugin(
+    "info",
+    `org-join gate: decision=${shouldPromptOrgJoin ? "show" : "suppress"} identityPresent=${identityPresent} adopted=${adopted} hasKnownOrg=${hasKnownOrg} orgCount=${knownOrgCount} bound=${isBoundProject} promptedThisSession=${orgJoinPromptedThisSession}`,
+  );
+  if (shouldPromptOrgJoin) {
+    setTimeout(() => {
+      if (coreDialogBusy()) return;
+      orgJoinPromptedThisSession = true;
+      confirm(
+        "In order to get the most from WeVibe, it's recommended that you join an org. Join one now?",
+        openDashboard,
+      );
+    }, 900);
   }
 
   // --- Slash commands / palette entries ------------------------------------
@@ -1261,6 +1327,14 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
           run: openDashboard,
         },
         {
+          name: "wevibe.bind",
+          title: "WeVibe: Bind this project to an org",
+          category: "WeVibe",
+          namespace: "palette",
+          slashName: "wevibe-bind",
+          run: bindProject,
+        },
+        {
           name: "wevibe.status",
           title: "WeVibe: Show identity status",
           category: "WeVibe",
@@ -1272,8 +1346,7 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
               if (!s.hasIdentity) return toast("info", "No WeVibe identity yet — run /wevibe-setup.");
               alert(
                 `Identity: present\nKey: ${s.ed25519PublicKey ?? "(sidecar missing)"}\n` +
-                  `Created: ${s.createdAt ?? "unknown"}\nExtracted: ${s.extracted}\n` +
-                  `Sessions counted: ${counted.size}`,
+                  `Created: ${s.createdAt ?? "unknown"}\nExtracted: ${s.extracted}`,
               );
             });
           },

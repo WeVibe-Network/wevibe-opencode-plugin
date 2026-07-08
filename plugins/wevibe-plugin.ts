@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url"
 import { createHash, randomUUID } from "node:crypto"
 import { SessionMetricsRecorder } from "./metrics"
 import { buildRecallHarvest, type RecallHarvestSignals } from "./recall-harvest"
+import { detectBinding, type BindingState } from "./binding"
+import { resolveScopedWeVibeDir, scopedLogDir, scopedRunsDir, scopedStateDir } from "./wevibe-paths"
 
 interface CachedMemory {
   cid: string
@@ -70,9 +72,8 @@ interface ServedMemoriesStore {
 export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, $ }) => {
   const initTs = Date.now()
   const fs = await import("node:fs")
-  const { existsSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, statSync, openSync, closeSync } = fs
+  const { existsSync, appendFileSync, readFileSync, writeFileSync, mkdirSync, statSync, openSync, closeSync, chmodSync } = fs
 
-  const STATE_DIRNAME = ".opencode"
   const QUEUE_FILENAME = "wevibe-plugin-queue.json"
   const DECISIONS_FILENAME = "wevibe-plugin-decisions.json"
   const STATUS_FILENAME = "wevibe-plugin-status.json"
@@ -183,6 +184,11 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         version: 1,
         memories,
       })
+      try {
+        chmodSync(SERVED_MEMORIES_PATH, 0o600)
+      } catch {
+        // hygiene best-effort
+      }
     } catch {
       // best-effort: never let served-memory persistence crash plugin flow
     }
@@ -208,6 +214,11 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         version: 1,
         memories,
       })
+      try {
+        chmodSync(SERVED_MEMORIES_PATH, 0o600)
+      } catch {
+        // hygiene best-effort
+      }
     } catch {
       // best-effort: never let served-memory GC crash plugin flow
     }
@@ -351,90 +362,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     return undefined
   }
 
-  const safeExists = (filePath: string): boolean => {
-    try {
-      return existsSync(filePath)
-    } catch {
-      return false
-    }
-  }
-
-  const safeIsDirectory = (filePath: string): boolean => {
-    try {
-      return statSync(filePath).isDirectory()
-    } catch {
-      return false
-    }
-  }
-
-  const findWorkspaceMetaLogDir = (startDir: string): string | undefined => {
-    let current: string
-    try {
-      current = resolve(startDir)
-    } catch {
-      return undefined
-    }
-
-    while (true) {
-      const metaDir = join(current, "wevibe-meta")
-      if (safeExists(metaDir) && safeIsDirectory(metaDir)) {
-        return join(metaDir, ".logs")
-      }
-
-      const parent = dirname(current)
-      if (parent === current) {
-        return undefined
-      }
-      current = parent
-    }
-  }
-
   const resolvedWeVibeRoot = findWeVibeRoot()
-
-  const resolveMetaLogDir = (): string => {
-    const envLogDir = process.env.WEVIBE_LOG_DIR
-    if (typeof envLogDir === "string" && envLogDir.trim() !== "") {
-      return envLogDir
-    }
-
-    const candidates = new Set<string>()
-    const pushCandidate = (value: string | undefined | null): void => {
-      if (typeof value !== "string" || value.trim() === "") {
-        return
-      }
-      candidates.add(value)
-    }
-
-    try {
-      pushCandidate(process.cwd())
-    } catch {
-      // best-effort cwd lookup
-    }
-
-    try {
-      const pluginFile = fileURLToPath(import.meta.url)
-      pushCandidate(dirname(pluginFile))
-    } catch {
-      // best-effort plugin self-location
-    }
-
-    pushCandidate(resolvedWeVibeRoot)
-    pushCandidate(worktree)
-    pushCandidate(directory)
-
-    for (const startDir of candidates) {
-      const discovered = findWorkspaceMetaLogDir(startDir)
-      if (discovered) {
-        return discovered
-      }
-    }
-
-    try {
-      return join(homedir(), ".wevibe", "logs")
-    } catch {
-      return join(".wevibe", "logs")
-    }
-  }
 
   const wevibeRoot = resolvedWeVibeRoot ?? worktree
 
@@ -444,21 +372,24 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const safeWorktree = isUsableDir(worktree) ? worktree : undefined
   const safeDirectory = isUsableDir(directory) ? directory : undefined
   const safeCwd = isUsableDir(process.cwd()) ? process.cwd() : undefined
-  // Guaranteed-writable fallback when no usable project dir exists at load time
-  // (e.g. the plugin loads at server start with worktree="/"). Prevents
-  // mkdir('/.opencode') EROFS crashes that would fail the whole plugin load.
-  const writableFallback = join(homedir(), ".wevibe")
-  const errorLogRoot = safeWorktree ?? safeDirectory ?? safeCwd ?? resolvedWeVibeRoot ?? writableFallback
-  const metaLogDir = resolveMetaLogDir()
-  const errorLogPath = join(metaLogDir, "wevibe-plugin-errors.log")
+  const scopedWeVibeDir = resolveScopedWeVibeDir(
+    {
+      worktree: safeWorktree,
+      directory: safeDirectory,
+      cwd: safeCwd,
+      wevibeRoot: resolvedWeVibeRoot,
+    },
+    homedir(),
+  )
+  const logDir = scopedLogDir(scopedWeVibeDir, process.env.WEVIBE_LOG_DIR)
+  const errorLogPath = join(logDir, "wevibe-plugin-errors.log")
   try {
-    mkdirSync(metaLogDir, { recursive: true })
+    mkdirSync(logDir, { recursive: true })
   } catch {
     // best-effort logging only
   }
 
-  const stateRoot = safeWorktree ?? safeDirectory ?? safeCwd ?? writableFallback
-  const stateDir = join(stateRoot, STATE_DIRNAME)
+  const stateDir = scopedStateDir(scopedWeVibeDir)
   const queuePath = join(stateDir, QUEUE_FILENAME)
   const decisionPath = join(stateDir, DECISIONS_FILENAME)
   const statusPath = join(stateDir, STATUS_FILENAME)
@@ -514,7 +445,6 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   initialQueue.forEach(entry => pendingCids.add(entry.id))
 
   const hubUrl = process.env.WEVIBE_HUB_URL
-  const orgId = process.env.WEVIBE_ORG_ID
 
   function logPlugin(level: "info" | "warn" | "error", message: string, trace?: string): void {
     const line = `${new Date().toISOString()} [${level}]${trace ? ` trace=${trace}` : ""} ${message}`
@@ -554,14 +484,31 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     }
   }
 
-  logPlugin("info", `plugin init: dir=${directory} worktree=${worktree ?? "none"} logRoot=${errorLogRoot} initTs=${initTs}`)
+  const refreshBindingState = (): void => {
+    void detectBinding(worktree)
+      .then((s) => {
+        bindingState = s
+        logPlugin(
+          "info",
+          `[binding] session bind: active=${s.active} org=${s.orgId ?? "-"} fp=${fp(s.fingerprint ?? "")} src=${s.source ?? "-"} root=${worktree}`,
+        )
+      })
+      .catch((e) => {
+        logPlugin("error", `[binding] detect failed: ${e instanceof Error ? e.message : String(e)}`)
+      })
+  }
+
+  logPlugin(
+    "info",
+    `plugin init: dir=${directory} worktree=${worktree ?? "none"} wevibeDir=${scopedWeVibeDir} logDir=${logDir} runsDir=${scopedRunsDir(scopedWeVibeDir)} initTs=${initTs}`,
+  )
 
   const logDebug = (message: string): void => {
     if (process.env.WEVIBE_PLUGIN_DEBUG === "1") logPlugin("info", message)
   }
 
   const metricsRecorder = new SessionMetricsRecorder({
-    runsDir: join(errorLogRoot, "runs"),
+    runsDir: scopedRunsDir(scopedWeVibeDir),
     log: (message) => logDebug(message),
   })
 
@@ -630,8 +577,9 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         reportedCids.delete(decision.memoryID)
         addToBlacklistFile(decision.memoryID)
 
-        if (orgId) {
-          void submitDenial(orgId, decision).catch(err => {
+        if (bindingState.active && bindingState.orgId) {
+          const boundOrg = bindingState.orgId
+          void submitDenial(boundOrg, decision).catch(err => {
             logPlugin("error", `denial submission failed: ${err instanceof Error ? err.message : String(err)}`)
           })
         }
@@ -644,12 +592,13 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         deniedCids.delete(decision.memoryID)
         reportedCids.add(decision.memoryID)
 
-        if (!hubUrl || !orgId) {
-          logPlugin("error", "report decision ignored: WEVIBE_HUB_URL or WEVIBE_ORG_ID not configured")
+        if (!hubUrl || !bindingState.active || !bindingState.orgId) {
+          logPlugin("error", "report decision ignored: WEVIBE_HUB_URL missing or session not bound to an org")
           continue
         }
 
-        void submitReport(orgId, decision, entry).catch(err => {
+        const boundOrg = bindingState.orgId
+        void submitReport(boundOrg, decision, entry).catch(err => {
           logPlugin("error", `report submission failed: ${err instanceof Error ? err.message : String(err)}`)
         })
       }
@@ -668,6 +617,11 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     decision: StoredDecision,
     entry?: PendingMemory,
   ): Promise<void> => {
+    if (!bindingState.active) {
+      logPlugin("info", "[binding] report relay suppressed: session dormant (unbound)")
+      return
+    }
+
     if (!entry) {
       logPlugin("warn", `report decision for unknown memory id=${decision.memoryID}`)
       return
@@ -704,6 +658,11 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     organizationId: string,
     decision: StoredDecision,
   ): Promise<void> {
+    if (!bindingState.active) {
+      logPlugin("info", "[binding] denial relay suppressed: session dormant (unbound)")
+      return
+    }
+
     const token = readWeVibeMcpToken()
     if (!token) {
       logPlugin("error", "no MCP session token — skipping denial submission")
@@ -733,6 +692,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const cachedMemories: CachedMemory[] = []
   let lastRecalledQuery = ""
   let wevibeAvailable = false
+  let bindingState: BindingState = { active: false }
   let memoryCacheKey = ""
   let memoryCacheTimestamp = 0
   const MEMORY_CACHE_TTL_MS = 5 * 60 * 1000  // 5 minutes
@@ -911,7 +871,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       // Use a real node: process.execPath when it is node, else "node" resolved
       // via PATH (the spawn env below inherits process.env.PATH).
       const nodeBin = /[\\/]node$/.test(process.execPath) ? process.execPath : "node"
-      const mcpLogDir = metaLogDir
+      const mcpLogDir = logDir
       const mcpLogPath = join(mcpLogDir, "host-mcp-4450.log")
       const spawnTrace = newTrace()
       spawnTraceForFailure = spawnTrace
@@ -932,7 +892,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       if (mcpLogFd !== undefined) { try { closeSync(mcpLogFd) } catch { /* child holds its own inherited fd */ } }
       logPlugin(
         "info",
-        `mcp-4450 auto-start: bin=${wevibeMcpBin} pid=${child.pid} capture=${mcpLogFd !== undefined ? mcpLogPath : "FAILED"} hub=${env.WEVIBE_HUB_URL} org_fp=${fp(process.env.WEVIBE_ORG_ID)} epoch_fp=${fp(process.env.WEVIBE_EPOCH)} agentkey_fp=${fp(process.env.WEVIBE_AGENT_KEY ?? process.env.WEVIBE_AGENT_PRIVATE_KEY)}`,
+        `mcp-4450 auto-start: bin=${wevibeMcpBin} pid=${child.pid} capture=${mcpLogFd !== undefined ? mcpLogPath : "FAILED"} hub=${env.WEVIBE_HUB_URL} org_fp=${fp(bindingState.orgId)} epoch_fp=${fp(process.env.WEVIBE_EPOCH)} agentkey_fp=${fp(process.env.WEVIBE_AGENT_KEY ?? process.env.WEVIBE_AGENT_PRIVATE_KEY)}`,
         spawnTrace,
       )
 
@@ -1020,6 +980,9 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         body: JSON.stringify({
           query,
           ...harvestFields,
+          org_id: bindingState.orgId,
+          project_fingerprint: bindingState.fingerprint,
+          mc_version: 1,
           limit: recallLimit,
           session_id: sessionId,
           relevance_floor: relevanceFloor,
@@ -1204,7 +1167,10 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 
   let recallInFlight: Promise<void> | null = null
   const triggerRecall = (query: string): void => {
-    if (!wevibeAvailable) return
+    if (!wevibeAvailable || !bindingState.active) {
+      logPlugin("info", "[binding] recall suppressed: session dormant (unbound)")
+      return
+    }
     if (recallInFlight) return
     const trace = newTrace()
     recallInFlight = loadMemories(query, trace).catch(() => undefined).finally(() => { recallInFlight = null })
@@ -1299,6 +1265,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   } catch {
     // Context gathering is best-effort
   }
+
+  refreshBindingState()
 
   void (async () => {
     try {
@@ -1486,10 +1454,17 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         })?.catch(() => undefined)
       }
 
+      if (!bindingState.active) {
+        logPlugin("info", "[binding] serve relay suppressed: session dormant (unbound)")
+        upsertServedMemories(newlyServed.map(m => ({ cid: m.cid, text: m.text })), sid)
+        return
+      }
+
       for (const mem of newlyServed) {
         injectedSet.add(mem.cid)
         const token = readWeVibeMcpToken()
-        if (token && orgId) {
+        if (token && bindingState.active && bindingState.orgId) {
+          const boundOrg = bindingState.orgId
           const serveTrace = newTrace()
           logPlugin("info", `[serve] upsert cid=${mem.cid} sid=${sid}`, serveTrace)
           fetch(`${WEVIBE_MCP_HTTP}/v1/serves`, {
@@ -1500,7 +1475,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
               "X-WeVibe-Trace-Id": serveTrace,
             },
             body: JSON.stringify({
-              org_id: orgId,
+              org_id: boundOrg,
               memory_hash: mem.cid,
               nullifier: mem.cid,
               matched_keywords: mem.matchedKeywords ?? [],
@@ -1527,6 +1502,9 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     event: async (input) => {
       metricsRecorder.handleEvent(input.event)
       const eventType = (input.event as { type?: unknown } | undefined)?.type
+      if (eventType === "session.created") {
+        refreshBindingState()
+      }
       if (typeof eventType === "string") {
         const lower = eventType.toLowerCase()
         if (lower.includes("session") || lower.includes("idle") || lower.includes("exit")) {

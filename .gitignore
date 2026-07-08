@@ -26,9 +26,7 @@ yarn-debug.log*
 .dist/
 
 # Plugin runtime state
-wevibe-plugin-queue.json
-wevibe-plugin-decisions.json
-wevibe-plugin-status.json
+.wevibe/
 
 # Local orchestration docs (never committed)
 AGENTS.md
