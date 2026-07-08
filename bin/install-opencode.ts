@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { access, copyFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -60,6 +61,39 @@ function getOptionalValueFlag(flags: Record<string, string>, key: string): strin
     die(`--${key} requires a value`);
   }
   return value;
+}
+
+function resolveNpmBin(): string {
+  return process.platform === 'win32' ? 'npm.cmd' : 'npm';
+}
+
+type NpmCommandResult = {
+  stdout: string;
+  stderr: string;
+  status: number | null;
+  error: Error | null;
+};
+
+function runNpmCommand(args: string[], cwd: string): NpmCommandResult {
+  const result = spawnSync(resolveNpmBin(), args, {
+    cwd,
+    encoding: 'utf8',
+  });
+  return {
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? '',
+    status: result.status,
+    error: result.error ?? null,
+  };
+}
+
+function logNpmStdoutStderr(stdout: string, stderr: string): void {
+  if (stdout.trim().length > 0) {
+    console.log(stdout.trimEnd());
+  }
+  if (stderr.trim().length > 0) {
+    console.warn(stderr.trimEnd());
+  }
 }
 
 function isJsonObject(value: unknown): value is JsonObject {
@@ -147,6 +181,7 @@ function resolveInstallerRuntimePaths(flags: Record<string, string>): {
   serverScript: string;
   tuiSource: string;
   enginePluginPath: string;
+  mcpPackageRoot: string;
 } {
   const __filename = fileURLToPath(import.meta.url);
   const repoRoot = path.resolve(path.dirname(__filename), '..');
@@ -165,10 +200,11 @@ function resolveInstallerRuntimePaths(flags: Record<string, string>): {
       process.env.WEVIBE_MCP_DIR ??
       path.join(workspaceRoot, 'wevibe-mcp', 'dist'),
   );
+  const mcpPackageRoot = path.resolve(mcpDistDir, '..');
   const adminScript = path.join(mcpDistDir, 'admin.js');
   const serverScript = path.join(mcpDistDir, 'server.js');
 
-  return { adminScript, serverScript, tuiSource, enginePluginPath };
+  return { adminScript, serverScript, tuiSource, enginePluginPath, mcpPackageRoot };
 }
 
 async function copyCanonicalPlugin(sourcePath: string, destinationPath: string, force: boolean): Promise<PluginFileStatus> {
@@ -321,10 +357,11 @@ function removeMcpEntry(existing: JsonObject): JsonObject {
 async function cmdInstallOpencode(flags: Record<string, string>) {
   const asJson = hasFlag(flags, 'json');
   const force = hasFlag(flags, 'force');
+  const skipCliLink = hasFlag(flags, 'no-cli-link');
   const nodeBin = getOptionalValueFlag(flags, 'node') ?? 'node';
   const configDir = resolveOpencodeConfigDir(flags);
 
-  const { adminScript, serverScript, tuiSource, enginePluginPath } = resolveInstallerRuntimePaths(flags);
+  const { adminScript, serverScript, tuiSource, enginePluginPath, mcpPackageRoot } = resolveInstallerRuntimePaths(flags);
   if (!await pathExists(tuiSource)) {
     die(`Canonical opencode plugin source is missing: ${tuiSource}`);
   }
@@ -369,6 +406,43 @@ async function cmdInstallOpencode(flags: Record<string, string>) {
   }
   const opencodeJson = await writeJsonObjectFile(opencodeJsonPath, opencodeExisting, opencodeMerged, force);
 
+  if (skipCliLink) {
+    console.log('Skipping `wevibe` CLI link because --no-cli-link was passed.');
+  } else {
+    console.log('Linking `wevibe` CLI via npm link (no publish)…');
+    console.log(`  mcp package root: ${mcpPackageRoot}`);
+    try {
+      const linkResult = runNpmCommand(['link'], mcpPackageRoot);
+      logNpmStdoutStderr(linkResult.stdout, linkResult.stderr);
+      if (linkResult.error || linkResult.status !== 0) {
+        console.error('Failed to link `wevibe` CLI via npm link.');
+        if (linkResult.error) {
+          console.error(linkResult.error);
+        }
+        if (linkResult.status !== null) {
+          console.error(`npm link exit code: ${linkResult.status}`);
+        }
+        if (linkResult.stdout.trim().length > 0) {
+          console.error(`npm link stdout:\n${linkResult.stdout.trimEnd()}`);
+        }
+        if (linkResult.stderr.trim().length > 0) {
+          console.error(`npm link stderr:\n${linkResult.stderr.trimEnd()}`);
+        }
+        console.warn(
+          `Plugin install completed, but CLI link failed. Run "${resolveNpmBin()} link" manually in ${mcpPackageRoot}.`,
+        );
+      } else {
+        console.log('`wevibe` command now on PATH.');
+      }
+    } catch (err) {
+      console.error('Failed to link `wevibe` CLI via npm link.');
+      console.error(err);
+      console.warn(
+        `Plugin install completed, but CLI link failed. Run "${resolveNpmBin()} link" manually in ${mcpPackageRoot}.`,
+      );
+    }
+  }
+
   const result: InstallOpencodeResult = {
     ok: true,
     configDir,
@@ -397,8 +471,9 @@ async function cmdInstallOpencode(flags: Record<string, string>) {
 
 async function cmdUninstallOpencode(flags: Record<string, string>) {
   const asJson = hasFlag(flags, 'json');
+  const skipCliLink = hasFlag(flags, 'no-cli-link');
   const configDir = resolveOpencodeConfigDir(flags);
-  const { enginePluginPath } = resolveInstallerRuntimePaths(flags);
+  const { enginePluginPath, mcpPackageRoot } = resolveInstallerRuntimePaths(flags);
 
   const tuiJsonPath = path.join(configDir, 'tui.json');
   const pluginPath = path.join(configDir, 'tui', 'wevibe.tsx');
@@ -429,6 +504,37 @@ async function cmdUninstallOpencode(flags: Record<string, string>) {
     const opencodeRemoved = removeServerPluginEntry(opencodeWithoutMcp, enginePluginPath);
     const status = await writeJsonObjectFile(opencodeJsonPath, opencodeExisting, opencodeRemoved, false);
     opencodeJson = status === 'created' ? 'updated' : status;
+  }
+
+  if (skipCliLink) {
+    console.log('Skipping global `wevibe` CLI unlink because --no-cli-link was passed.');
+  } else {
+    console.log('Removing global `wevibe` CLI link via npm rm --global wevibe-mcp…');
+    console.log(`  mcp package root: ${mcpPackageRoot}`);
+    try {
+      const unlinkResult = runNpmCommand(['rm', '--global', 'wevibe-mcp'], mcpPackageRoot);
+      logNpmStdoutStderr(unlinkResult.stdout, unlinkResult.stderr);
+      if (unlinkResult.error || unlinkResult.status !== 0) {
+        console.warn('Unable to remove global wevibe-mcp via npm (it may already be absent).');
+        if (unlinkResult.error) {
+          console.warn(unlinkResult.error);
+        }
+        if (unlinkResult.status !== null) {
+          console.warn(`npm rm --global wevibe-mcp exit code: ${unlinkResult.status}`);
+        }
+        if (unlinkResult.stdout.trim().length > 0) {
+          console.warn(`npm rm --global wevibe-mcp stdout:\n${unlinkResult.stdout.trimEnd()}`);
+        }
+        if (unlinkResult.stderr.trim().length > 0) {
+          console.warn(`npm rm --global wevibe-mcp stderr:\n${unlinkResult.stderr.trimEnd()}`);
+        }
+      } else {
+        console.log('Removed global `wevibe` CLI link.');
+      }
+    } catch (err) {
+      console.warn('Unable to remove global wevibe-mcp via npm (it may already be absent).');
+      console.warn(err);
+    }
   }
 
   const result: UninstallOpencodeResult = {
@@ -488,8 +594,8 @@ function printUsage() {
   console.log(`wevibe-install-opencode — install/uninstall WeVibe OpenCode integration
 
 Usage:
-  tsx bin/install-opencode.ts install-opencode [--config-dir <path>] [--node <path>] [--engine-path <abs>] [--mcp-dir <path>] [--force] [--json]
-  tsx bin/install-opencode.ts uninstall-opencode [--config-dir <path>] [--engine-path <abs>] [--json]
+  tsx bin/install-opencode.ts install-opencode [--config-dir <path>] [--node <path>] [--engine-path <abs>] [--mcp-dir <path>] [--no-cli-link] [--force] [--json]
+  tsx bin/install-opencode.ts uninstall-opencode [--config-dir <path>] [--engine-path <abs>] [--mcp-dir <path>] [--no-cli-link] [--json]
 
 Default command:
   install-opencode (when no subcommand is provided)
