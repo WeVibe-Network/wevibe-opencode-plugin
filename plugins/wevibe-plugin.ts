@@ -753,7 +753,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     logPlugin("warn", `resolve warning: wevibe-mcp not found relative to worktree=${worktree}, directory=${directory}`)
   }
 
-  const WEVIBE_MCP_HTTP = 'http://127.0.0.1:4450'
+  const WEVIBE_MCP_HTTP = process.env.WEVIBE_MCP_HTTP_URL?.trim() || 'http://127.0.0.1:4450'
+  const WEVIBE_MCP_EXTERNAL = Boolean(process.env.WEVIBE_MCP_HTTP_URL?.trim())
   const TOKEN_PATH = join(homedir(), ".wevibe", "mcp-session-token")
   const REQUEST_TIMEOUT_MS = 10000
 
@@ -768,6 +769,16 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   async function ensureWeVibeMcpRunning(): Promise<boolean> {
     const token = readWeVibeMcpToken()
     const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {}
+    if (WEVIBE_MCP_EXTERNAL) {
+      try {
+        const healthRes = await fetch(`${WEVIBE_MCP_HTTP}/v1/health`, { headers, signal: AbortSignal.timeout(2000) })
+        logPlugin("info", `external mcp mode: url=${WEVIBE_MCP_HTTP} health=${healthRes.ok ? "ok" : "unreachable"}`)
+        return healthRes.ok
+      } catch {
+        logPlugin("info", `external mcp mode: url=${WEVIBE_MCP_HTTP} health=unreachable`)
+        return false
+      }
+    }
     try {
       const healthRes = await fetch(`${WEVIBE_MCP_HTTP}/v1/health`, { headers, signal: AbortSignal.timeout(2000) })
       if (healthRes.ok) {
