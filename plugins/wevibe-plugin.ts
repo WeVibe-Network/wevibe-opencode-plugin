@@ -965,6 +965,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       }
       const { relevanceFloor, maxInjected, recallLimit } = getRecallGovernorConfig()
       const sessionId = currentSessionId()
+      const buildTestSignals = metricsRecorder.getBuildTestSignals(sessionId)
       const editedFilesAbs = metricsRecorder.getEditedFiles(sessionId)
       const editedFiles = editedFilesAbs
         .map(filePath => relativizeToWorktree(filePath))
@@ -979,6 +980,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         directory: harvestProjectContext.directory,
         errorStrings: metricsRecorder.getRecentErrors(sessionId),
         editedFiles,
+        buildFailing: buildTestSignals.buildFailing,
+        testFailing: buildTestSignals.testFailing,
       }
       const harvestFields = buildRecallHarvest(harvestSignals)
       logPlugin("info", `[recall] harvest fields=${Object.keys(harvestFields).length}`, trace)

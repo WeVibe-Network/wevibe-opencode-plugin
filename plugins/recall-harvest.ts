@@ -22,6 +22,8 @@ export interface RecallHarvestFields {
   deps?: string[];
   errorStrings?: string[];
   files?: string[];
+  buildFailing?: boolean;
+  testFailing?: boolean;
   directory?: string;
   projectName?: string;
 }
@@ -138,6 +140,14 @@ export function buildRecallHarvest(signals: RecallHarvestSignals): RecallHarvest
   const files = dedupCap(signals.editedFiles, 15);
   if (files.length > 0) {
     fields.files = files;
+  }
+
+  if (typeof signals.buildFailing === 'boolean') {
+    fields.buildFailing = signals.buildFailing;
+  }
+
+  if (typeof signals.testFailing === 'boolean') {
+    fields.testFailing = signals.testFailing;
   }
 
   const directory = signals.directory ? normalizeText(signals.directory) : '';

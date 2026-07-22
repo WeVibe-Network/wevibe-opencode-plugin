@@ -39,6 +39,7 @@ test('buildRecallHarvest maps representative live signals into populated fields'
     directory: 'wevibe-mcp',
     errorStrings: ['ECONNREFUSED 127.0.0.1:6379'],
     editedFiles: ['src/cache.ts'],
+    buildFailing: false,
     testFailing: true,
   });
 
@@ -49,6 +50,8 @@ test('buildRecallHarvest maps representative live signals into populated fields'
   assert.ok(result.deps?.includes('ioredis'));
   assert.ok(result.errorStrings?.includes('ECONNREFUSED 127.0.0.1:6379'));
   assert.ok(result.files?.includes('src/cache.ts'));
+  assert.equal(result.buildFailing, false);
+  assert.equal(result.testFailing, true);
 });
 
 test('buildRecallHarvest omits empty optional arrays and strings', () => {
@@ -66,4 +69,6 @@ test('buildRecallHarvest omits empty optional arrays and strings', () => {
   assert.ok(!('deps' in result));
   assert.ok(!('files' in result));
   assert.ok(!('errorStrings' in result));
+  assert.ok(!('buildFailing' in result));
+  assert.ok(!('testFailing' in result));
 });

@@ -244,6 +244,19 @@ export class SessionMetricsRecorder {
     return s ? [...s.editedFiles] : []
   }
 
+  getBuildTestSignals(sessionID: string): { buildFailing?: boolean; testFailing?: boolean } {
+    const s = this.sessions.get(sessionID)
+    if (!s) return {}
+
+    const buildFailing = s.buildSuccess === false ? true : s.buildSuccess === true ? false : undefined
+    const testFailing = s.testPass === false ? true : s.testPass === true ? false : undefined
+
+    const signals: { buildFailing?: boolean; testFailing?: boolean } = {}
+    if (buildFailing !== undefined) signals.buildFailing = buildFailing
+    if (testFailing !== undefined) signals.testFailing = testFailing
+    return signals
+  }
+
   handleEvent(event: Event): void {
     try {
       // Cheap type filter FIRST: the event firehose fires very frequently.
