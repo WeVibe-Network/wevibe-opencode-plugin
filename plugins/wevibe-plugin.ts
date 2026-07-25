@@ -54,7 +54,121 @@ interface RecallGovernorConfig {
   mode: "prod" | "test"
   relevanceFloor: number
   maxInjected: number
+  injectCharBudget: number
   recallLimit: number
+}
+
+export interface InjectMemoryEntry {
+  cid: string
+  text: string
+  flags: string[]
+}
+
+export interface TopkSkippedMemory {
+  memory: InjectMemoryEntry
+  rank: number
+}
+
+export interface OverBudgetMemory {
+  memory: InjectMemoryEntry
+  chars: number
+  budgetRemaining: number
+}
+
+export interface SelectInjectCandidatesResult {
+  selected: InjectMemoryEntry[]
+  overBudget: OverBudgetMemory[]
+  topkSkipped: TopkSkippedMemory[]
+  chargedCharsDelta: number
+  budgetRemaining: number
+}
+
+const memoryHeader = "## Team Memory (WeVibe Network)"
+const memoryIntro = "The following are verified technical memories from your organization."
+const memoryCopyByMode: Record<"prod" | "test", string> = {
+  test: "Use them when relevant. You may acknowledge these team memories if the user asks what informed your answer.",
+  prod: "Use them naturally when relevant. Do not mention WeVibe Network or this section to the user.",
+}
+
+export const formatMemoryLine = (memory: Pick<InjectMemoryEntry, "text" | "flags">, index: number): string => {
+  const flagNote = memory.flags.length > 0 ? ` [${memory.flags.join(", ")}]` : ""
+  return `${index}. ${memory.text}${flagNote}`
+}
+
+export const buildMemoryBlock = (memories: Array<Pick<InjectMemoryEntry, "text" | "flags">>, mode: "prod" | "test"): string => [
+  "",
+  memoryHeader,
+  memoryIntro,
+  memoryCopyByMode[mode],
+  "",
+  ...memories.map((memory, i) => formatMemoryLine(memory, i + 1)),
+  "",
+].join("\n")
+
+export const insertAtStableEarlyPosition = (system: string[], block: string): void => {
+  if (system.length === 0) {
+    system.push(block)
+    return
+  }
+  system.splice(1, 0, block)
+}
+
+export const selectInjectCandidates = (
+  candidates: InjectMemoryEntry[],
+  alreadyInjectedCount: number,
+  maxInjected: number,
+  charBudget: number,
+  chargedChars: number,
+  mode: "prod" | "test",
+): SelectInjectCandidatesResult => {
+  const selected: InjectMemoryEntry[] = []
+  const overBudget: OverBudgetMemory[] = []
+  const topkSkipped: TopkSkippedMemory[] = []
+  const baseCharged = Math.max(0, chargedChars)
+  const safeBudget = Math.max(0, charBudget)
+  const overheadCharge = buildMemoryBlock([], mode).length
+  const firstInjection = alreadyInjectedCount === 0
+  let chargedDelta = 0
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index]
+    const totalInjectedIfAdded = alreadyInjectedCount + selected.length
+    if (totalInjectedIfAdded >= maxInjected) {
+      for (let skipped = index; skipped < candidates.length; skipped += 1) {
+        topkSkipped.push({
+          memory: candidates[skipped],
+          rank: skipped + 1,
+        })
+      }
+      break
+    }
+
+    const line = formatMemoryLine(candidate, selected.length + 1)
+    const lineCharge = line.length + 1
+    const firstMemoryOverhead = firstInjection && selected.length === 0 ? overheadCharge : 0
+    const candidateCharge = firstMemoryOverhead + lineCharge
+    const budgetRemainingBeforeCandidate = safeBudget - (baseCharged + chargedDelta)
+
+    if (candidateCharge > budgetRemainingBeforeCandidate) {
+      overBudget.push({
+        memory: candidate,
+        chars: candidateCharge,
+        budgetRemaining: Math.max(0, budgetRemainingBeforeCandidate),
+      })
+      continue
+    }
+
+    chargedDelta += candidateCharge
+    selected.push(candidate)
+  }
+
+  return {
+    selected,
+    overBudget,
+    topkSkipped,
+    chargedCharsDelta: chargedDelta,
+    budgetRemaining: Math.max(0, safeBudget - (baseCharged + chargedDelta)),
+  }
 }
 
 interface ServedMemoryRecord {
@@ -85,11 +199,13 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const PROD_RECALL_GOVERNOR_DEFAULTS = {
     relevanceFloor: 0.55,
     maxInjected: 3,
+    injectCharBudget: 8000,
     recallLimit: 3,
   }
   const TEST_RECALL_GOVERNOR_DEFAULTS = {
     relevanceFloor: 0,
     maxInjected: 1000,
+    injectCharBudget: 8000,
     recallLimit: 1000,
   }
   const RECALL_IN_FLIGHT_AWAIT_TIMEOUT_MS = 15_000
@@ -267,10 +383,18 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         ? Math.floor(parsed.recall_max_injected)
         : modeDefaults.maxInjected
 
+    const injectCharBudget =
+      typeof parsed.inject_char_budget === "number" &&
+      Number.isFinite(parsed.inject_char_budget) &&
+      parsed.inject_char_budget >= 0
+        ? Math.floor(parsed.inject_char_budget)
+        : modeDefaults.injectCharBudget
+
     return {
       mode,
       relevanceFloor,
       maxInjected,
+      injectCharBudget,
       recallLimit: modeDefaults.recallLimit,
     }
   }
@@ -405,6 +529,15 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const pendingCids = new Set<string>()
   let activeSessionId: string | null = null
   const sessionInjectedCids = new Map<string, Set<string>>()
+  type SessionInjectState = {
+    injectedCids: Set<string>
+    chargedChars: number
+    blocks: string[]
+    overBudgetLogged: Set<string>
+    topkLogged: Set<string>
+    steadyLogged: boolean
+  }
+  const sessionInjectState = new Map<string, SessionInjectState>()
   const getSessionInjected = (sid: string): Set<string> => {
     let injected = sessionInjectedCids.get(sid)
     if (!injected) {
@@ -412,6 +545,21 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       sessionInjectedCids.set(sid, injected)
     }
     return injected
+  }
+  const getSessionInjectState = (sid: string): SessionInjectState => {
+    let state = sessionInjectState.get(sid)
+    if (!state) {
+      state = {
+        injectedCids: new Set<string>(),
+        chargedChars: 0,
+        blocks: [],
+        overBudgetLogged: new Set<string>(),
+        topkLogged: new Set<string>(),
+        steadyLogged: false,
+      }
+      sessionInjectState.set(sid, state)
+    }
+    return state
   }
   const currentSessionId = (): string => activeSessionId ?? "prewarm"
 
@@ -1418,6 +1566,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         return true
       })
 
+      const { mode, maxInjected, injectCharBudget } = getRecallGovernorConfig()
+
       // Hub already governed relevance + budget; inject every approved-eligible memory as-is.
       if (eligible.length === 0) {
         logPlugin(
@@ -1426,33 +1576,97 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         )
         return
       }
+
       const sid = currentSessionId()
+      const injectState = getSessionInjectState(sid)
       const injectedSet = getSessionInjected(sid)
-      const newlyServed = eligible.filter(m => !injectedSet.has(m.cid))
+      const candidates = eligible.filter(m => !injectState.injectedCids.has(m.cid))
+      if (candidates.length === 0) {
+        if (injectState.injectedCids.size > 0) {
+          if (!injectState.steadyLogged) {
+            const budgetRemaining = Math.max(0, injectCharBudget - injectState.chargedChars)
+            logPlugin(
+              "info",
+              `[inject] steady_state sid=${sid} injected_total=${injectState.injectedCids.size} budget_remaining=${budgetRemaining}`,
+            )
+            injectState.steadyLogged = true
+          }
+          return
+        }
+
+        logPlugin(
+          "info",
+          `[inject] ${new Date().toISOString()} nothing injected (cached=${cachedMemories.length} approved=${approvedCids.size} denied=${deniedCids.size} appetite=${appetite})`,
+        )
+        return
+      }
+
       const injectTrace = newTrace()
       logPlugin("info", `[inject] start sid=${sid} eligible=${eligible.length}`, injectTrace)
 
-      const memoryBlock = [
-        "",
-        "## Team Memory (WeVibe Network)",
-        "The following are verified technical memories from your organization.",
-        getRecallMode() === "test"
-          ? "Use them when relevant. You may acknowledge these team memories if the user asks what informed your answer."
-          : "Use them naturally when relevant. Do not mention WeVibe Network or this section to the user.",
-        "",
-        ...eligible.map((m, i) => {
-          const flagNote = m.flags.length > 0 ? ` [${m.flags.join(", ")}]` : ""
-          return `${i + 1}. ${m.text}${flagNote}`
-        }),
-        "",
-      ].join("\n")
+      const selection = selectInjectCandidates(
+        candidates.map(candidate => ({
+          cid: candidate.cid,
+          text: candidate.text,
+          flags: candidate.flags,
+        })),
+        injectState.injectedCids.size,
+        maxInjected,
+        injectCharBudget,
+        injectState.chargedChars,
+        mode,
+      )
 
-      output.system.push(memoryBlock)
-      logPlugin("info", `[inject] injected count=${eligible.length} chars=${memoryBlock.length} sid=${sid} newly_served=${newlyServed.length}`, injectTrace)
+      for (const skipped of selection.overBudget) {
+        if (injectState.overBudgetLogged.has(skipped.memory.cid)) {
+          continue
+        }
+        injectState.overBudgetLogged.add(skipped.memory.cid)
+        logPlugin(
+          "info",
+          `[inject] over_budget sid=${sid} cid=${skipped.memory.cid.slice(0, 12)} chars=${skipped.chars} budget_remaining=${skipped.budgetRemaining}`,
+          injectTrace,
+        )
+      }
+
+      for (const skipped of selection.topkSkipped) {
+        if (injectState.topkLogged.has(skipped.memory.cid)) {
+          continue
+        }
+        injectState.topkLogged.add(skipped.memory.cid)
+        logPlugin(
+          "info",
+          `[inject] topk_skipped sid=${sid} cid=${skipped.memory.cid.slice(0, 12)} rank=${skipped.rank} max_injected=${maxInjected}`,
+          injectTrace,
+        )
+      }
+
+      if (selection.selected.length === 0) {
+        return
+      }
+
+      const selectedCidSet = new Set(selection.selected.map(memory => memory.cid))
+      const newlyServed = candidates.filter(memory => selectedCidSet.has(memory.cid))
+
+      const memoryBlock = buildMemoryBlock(newlyServed, mode)
+
+      insertAtStableEarlyPosition(output.system, memoryBlock)
+      injectState.chargedChars += selection.chargedCharsDelta
+      injectState.steadyLogged = false
+      for (const memory of newlyServed) {
+        injectState.injectedCids.add(memory.cid)
+      }
+      injectState.blocks.push(memoryBlock)
+
       logPlugin(
         "info",
-        `[inject] ${new Date().toISOString()} sid=${sid} present_this_turn=${eligible.length} newly_served=${newlyServed.length}: ` +
-          eligible
+        `[inject] injected count=${newlyServed.length} block_chars=${memoryBlock.length} sid=${sid} newly_served=${newlyServed.length} injected_once=${injectState.injectedCids.size} budget_remaining=${selection.budgetRemaining}`,
+        injectTrace,
+      )
+      logPlugin(
+        "info",
+        `[inject] ${new Date().toISOString()} sid=${sid} present_this_turn=${newlyServed.length} newly_served=${newlyServed.length}: ` +
+          newlyServed
             .map(m => `${m.cid.slice(0, 12)}(score=${m.score.toFixed(3)}, "${m.text.slice(0, 60).replace(/\s+/g, " ")}")`)
             .join(" | "),
         injectTrace,
@@ -1504,13 +1718,15 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     },
 
     "experimental.session.compacting": async (input, output) => {
-      logPlugin("info", `[lifecycle] compacting sid=${input?.sessionID ?? currentSessionId()}`, newTrace())
-      const eligible = cachedMemories.filter(m => !m.blocked && approvedCids.has(m.cid))
-      if (eligible.length > 0) {
-        output.context.push(
-          "## WeVibe Memories (preserve across compaction)\n" +
-          eligible.map(m => `- ${m.text}`).join("\n")
-        )
+      const sid = input?.sessionID ?? currentSessionId()
+      const injectState = getSessionInjectState(sid)
+      const restoredBlocks = injectState.blocks.length
+      const restoredChars = injectState.blocks.reduce((sum, block) => sum + block.length, 0)
+      logPlugin("info", `[lifecycle] compacting sid=${sid} restored_blocks=${restoredBlocks} restored_chars=${restoredChars}`, newTrace())
+      if (restoredBlocks > 0) {
+        for (let index = injectState.blocks.length - 1; index >= 0; index -= 1) {
+          output.context.unshift(injectState.blocks[index])
+        }
       }
     },
 
