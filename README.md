@@ -50,6 +50,14 @@ Supported flags:
 
 Reason: the engine plugin is the **sole** `:4450` MCP spawner because it provides the correct `WEVIBE_UMBRAL_SIDECAR_BIN` and `WEVIBE_GUARD_BIN` environment. A second opencode-spawned env-less MCP process would break leader-side Umbral crypto.
 
+## Configuration
+
+`~/.wevibe/plugin-config.json` supports `inject_char_budget` for memory injection budgeting:
+
+- default: `8000` chars (roughly ~2k tokens at ~4 chars/token)
+- bounds the session's total injected memory block size
+- memories that would exceed remaining budget are skipped for that session and logged as `[inject] over_budget`
+
 ## Reference template in this repo
 
 `tui.json` in this repo is a template:
