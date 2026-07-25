@@ -7,6 +7,8 @@ import { SessionMetricsRecorder } from "./metrics"
 import { buildRecallHarvest, type RecallHarvestSignals } from "./recall-harvest"
 import { detectBinding, type BindingState } from "./binding"
 import { resolveScopedWeVibeDir, scopedLogDir, scopedRunsDir, scopedStateDir } from "./wevibe-paths"
+import { createSpool, excerpt, fp8, type Spool } from "./gstv-spool"
+import { GSTV_BOUNDARY_TIMEOUT_MS, onSessionCreated, onSessionIdle, type GstvHookDeps } from "./gstv-hooks"
 
 interface CachedMemory {
   cid: string
@@ -518,6 +520,14 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const decisionPath = join(stateDir, DECISIONS_FILENAME)
   const statusPath = join(stateDir, STATUS_FILENAME)
   const heartbeatPath = join(stateDir, "wevibe-tui-active.json")
+  const sensorsEnabled = !["0", "false", "off"].includes((process.env.WEVIBE_GSTV_SENSORS ?? "").trim().toLowerCase())
+  const spool: Spool = createSpool({
+    stateDir,
+    disabled: !sensorsEnabled,
+    onError: (msg) => logPlugin("error", msg, newTrace()),
+  })
+  const gstvBoundaryRan = new Set<string>()
+  const toolCallStartedAt = new Map<string, number>()
 
   ensureFile(queuePath, "[]\n")
   ensureFile(decisionPath, "[]\n")
@@ -538,6 +548,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     steadyLogged: boolean
   }
   const sessionInjectState = new Map<string, SessionInjectState>()
+  const compactionRestoreCounts = new Map<string, number>()
   const getSessionInjected = (sid: string): Set<string> => {
     let injected = sessionInjectedCids.get(sid)
     if (!injected) {
@@ -646,6 +657,69 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       .catch((e) => {
         logPlugin("error", `[binding] detect failed: ${e instanceof Error ? e.message : String(e)}`)
       })
+  }
+
+  const sensorRepoRoot = safeWorktree ?? safeDirectory ?? process.cwd()
+  const runCommand = async (command: string, timeoutMs: number): Promise<{ exitCode: number; durationMs: number }> => {
+    const startedAt = Date.now()
+    const durationMs = (): number => Math.max(0, Date.now() - startedAt)
+    const boundedTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : GSTV_BOUNDARY_TIMEOUT_MS
+
+    try {
+      if (typeof $ !== "function") {
+        return { exitCode: 1, durationMs: durationMs() }
+      }
+
+      const shellCommand = $.nothrow().cwd(sensorRepoRoot)`sh -c ${command}`.quiet()
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+      const timeoutResult = new Promise<"timeout">((resolve) => {
+        timeoutHandle = setTimeout(() => {
+          const candidate = shellCommand as unknown as {
+            kill?: (signal?: string) => void
+            abort?: () => void
+          }
+          try {
+            candidate.kill?.("SIGKILL")
+          } catch {
+            // best-effort kill only
+          }
+          try {
+            candidate.abort?.()
+          } catch {
+            // best-effort abort only
+          }
+          resolve("timeout")
+        }, boundedTimeoutMs)
+      })
+
+      const race = await Promise.race<["ok", { exitCode?: unknown }] | "timeout">([
+        shellCommand.then((result) => ["ok", result]),
+        timeoutResult,
+      ])
+
+      if (race === "timeout") {
+        return {
+          exitCode: 124,
+          durationMs: durationMs(),
+        }
+      }
+
+      if (timeoutHandle !== undefined) {
+        clearTimeout(timeoutHandle)
+      }
+
+      const exitCode = typeof race[1].exitCode === "number" ? race[1].exitCode : 1
+      return {
+        exitCode,
+        durationMs: durationMs(),
+      }
+    } catch (err) {
+      const candidate = err as { exitCode?: unknown }
+      return {
+        exitCode: typeof candidate.exitCode === "number" ? candidate.exitCode : 1,
+        durationMs: durationMs(),
+      }
+    }
   }
 
   logPlugin(
@@ -1204,7 +1278,6 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       if (data.status !== 'ok' || !data.memories) return
 
       cachedMemories.length = 0
-      let statusDirty = false
       const enqueueCandidates: Array<{
         cid: string
         text: string
@@ -1315,10 +1388,6 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       logDebug(
         `[recall] queued ${memoriesToQueue.length} of ${enqueueCandidates.length} memories (floor=${relevanceFloor}, budget=${maxInjected})`,
       )
-
-      if (statusDirty) {
-        recordStatusSnapshot()
-      }
 
       memoryCacheKey = query
       memoryCacheTimestamp = Date.now()
@@ -1472,6 +1541,114 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     return textParts.join("\n").trim()
   }
 
+  const spoolFromEvent = (evt: unknown): void => {
+    if (!sensorsEnabled) {
+      return
+    }
+
+    const event = evt as { type?: unknown; properties?: Record<string, unknown> } | undefined
+    const eventType = typeof event?.type === "string" ? event.type : undefined
+    if (!eventType) {
+      return
+    }
+
+    const properties = event?.properties && typeof event.properties === "object"
+      ? event.properties
+      : {}
+    const info = properties.info && typeof properties.info === "object"
+      ? properties.info as Record<string, unknown>
+      : undefined
+    const sessionIdRaw = properties.sessionID ?? info?.id
+    const sessionId = typeof sessionIdRaw === "string" && sessionIdRaw.length > 0
+      ? sessionIdRaw
+      : currentSessionId()
+
+    switch (eventType) {
+      case "session.created": {
+        spool.append({
+          sessionId,
+          event: "session.created",
+          payload: {
+            directory: String(info?.directory ?? safeDirectory),
+            ...(safeWorktree ? { worktree: safeWorktree } : {}),
+          },
+        })
+        return
+      }
+      case "session.idle": {
+        spool.append({
+          sessionId,
+          event: "session.idle",
+          payload: {},
+        })
+        return
+      }
+      case "session.error": {
+        const errorValue = properties.error as { message?: unknown } | string | undefined
+        const message =
+          (typeof errorValue === "object" && errorValue && typeof errorValue.message === "string")
+            ? errorValue.message
+            : (typeof errorValue === "string" ? errorValue : undefined)
+        spool.append({
+          sessionId,
+          event: "session.error",
+          payload: {
+            ...(message ? { message_excerpt: excerpt(message) } : {}),
+          },
+        })
+        return
+      }
+      case "file.edited": {
+        spool.append({
+          sessionId,
+          event: "file.edited",
+          payload: {
+            path: String(properties.file),
+          },
+        })
+        return
+      }
+      case "file.watcher.updated": {
+        spool.append({
+          sessionId,
+          event: "file.watcher.updated",
+          payload: {
+            path: String(properties.file),
+          },
+        })
+        return
+      }
+      case "lsp.client.diagnostics": {
+        spool.append({
+          sessionId,
+          event: "lsp.client.diagnostics",
+          payload: {
+            path: String(properties.path),
+            serverID: String(properties.serverID),
+            // opencode 1.4.10/1.18.1 emits no diagnostic bodies here.
+            diagnostics: [],
+          },
+        })
+        return
+      }
+      case "command.executed": {
+        // command.executed event does not carry exit_code in payload.
+        const argsExcerpt = excerpt(properties.arguments)
+        spool.append({
+          sessionId,
+          event: "command.executed",
+          payload: {
+            command: String(properties.name),
+            ...(argsExcerpt ? { args_excerpt: argsExcerpt } : {}),
+          },
+        })
+        return
+      }
+      default:
+        return
+    }
+  }
+
   return {
     "chat.message": async (input, output) => {
       if (input?.sessionID) activeSessionId = input.sessionID
@@ -1566,13 +1743,13 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         return true
       })
 
-      const { mode, maxInjected, injectCharBudget } = getRecallGovernorConfig()
+      const { mode, maxInjected, injectCharBudget, recallLimit } = getRecallGovernorConfig()
 
       // Hub already governed relevance + budget; inject every approved-eligible memory as-is.
       if (eligible.length === 0) {
         logPlugin(
           "info",
-          `[inject] ${new Date().toISOString()} nothing injected (cached=${cachedMemories.length} approved=${approvedCids.size} denied=${deniedCids.size} appetite=${appetite})`,
+          `[inject] ${new Date().toISOString()} nothing injected (cached=${cachedMemories.length} approved=${approvedCids.size} denied=${deniedCids.size} appetite=${appetite}) cadence=once`,
         )
         return
       }
@@ -1585,24 +1762,24 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         if (injectState.injectedCids.size > 0) {
           if (!injectState.steadyLogged) {
             const budgetRemaining = Math.max(0, injectCharBudget - injectState.chargedChars)
-            logPlugin(
-              "info",
-              `[inject] steady_state sid=${sid} injected_total=${injectState.injectedCids.size} budget_remaining=${budgetRemaining}`,
-            )
-            injectState.steadyLogged = true
-          }
+              logPlugin(
+                "info",
+                `[inject] steady_state sid=${sid} injected_total=${injectState.injectedCids.size} budget_remaining=${budgetRemaining} cadence=once`,
+              )
+              injectState.steadyLogged = true
+            }
           return
         }
 
         logPlugin(
           "info",
-          `[inject] ${new Date().toISOString()} nothing injected (cached=${cachedMemories.length} approved=${approvedCids.size} denied=${deniedCids.size} appetite=${appetite})`,
+          `[inject] ${new Date().toISOString()} nothing injected (cached=${cachedMemories.length} approved=${approvedCids.size} denied=${deniedCids.size} appetite=${appetite}) cadence=once`,
         )
         return
       }
 
       const injectTrace = newTrace()
-      logPlugin("info", `[inject] start sid=${sid} eligible=${eligible.length}`, injectTrace)
+      logPlugin("info", `[inject] start sid=${sid} eligible=${eligible.length} cadence=once`, injectTrace)
 
       const selection = selectInjectCandidates(
         candidates.map(candidate => ({
@@ -1624,7 +1801,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         injectState.overBudgetLogged.add(skipped.memory.cid)
         logPlugin(
           "info",
-          `[inject] over_budget sid=${sid} cid=${skipped.memory.cid.slice(0, 12)} chars=${skipped.chars} budget_remaining=${skipped.budgetRemaining}`,
+          `[inject] over_budget sid=${sid} cid=${skipped.memory.cid.slice(0, 12)} chars=${skipped.chars} budget_remaining=${skipped.budgetRemaining} cadence=once`,
           injectTrace,
         )
       }
@@ -1636,7 +1813,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         injectState.topkLogged.add(skipped.memory.cid)
         logPlugin(
           "info",
-          `[inject] topk_skipped sid=${sid} cid=${skipped.memory.cid.slice(0, 12)} rank=${skipped.rank} max_injected=${maxInjected}`,
+          `[inject] topk_skipped sid=${sid} cid=${skipped.memory.cid.slice(0, 12)} rank=${skipped.rank} max_injected=${maxInjected} cadence=once`,
           injectTrace,
         )
       }
@@ -1660,15 +1837,16 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 
       logPlugin(
         "info",
-        `[inject] injected count=${newlyServed.length} block_chars=${memoryBlock.length} sid=${sid} newly_served=${newlyServed.length} injected_once=${injectState.injectedCids.size} budget_remaining=${selection.budgetRemaining}`,
+        `[inject] injected count=${newlyServed.length} block_chars=${memoryBlock.length} block_tokens=${Math.round(memoryBlock.length / 4)} top_k=${recallLimit} sid=${sid} newly_served=${newlyServed.length} injected_once=${injectState.injectedCids.size} budget_remaining=${selection.budgetRemaining} cadence=once`,
         injectTrace,
       )
       logPlugin(
         "info",
         `[inject] ${new Date().toISOString()} sid=${sid} present_this_turn=${newlyServed.length} newly_served=${newlyServed.length}: ` +
           newlyServed
-            .map(m => `${m.cid.slice(0, 12)}(score=${m.score.toFixed(3)}, "${m.text.slice(0, 60).replace(/\s+/g, " ")}")`)
-            .join(" | "),
+            .map(m => `${m.cid.slice(0, 12)}(score=${m.score.toFixed(3)}, "${m.text.slice(0, 60).replace(/\s+/g, " ")}", kw=[${(m.matchedKeywords ?? []).join(",")}])`)
+            .join(" | ") +
+          " cadence=once",
         injectTrace,
       )
 
@@ -1711,7 +1889,18 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
               session_id: sid,
             }),
             signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-          }).catch(() => {})
+          })
+            .then(async (res) => {
+              if (res.ok) return
+              let reason = ""
+              try { reason = excerpt((await res.text()).slice(0, 512), 200) ?? "" } catch {
+                // best effort
+              }
+              logPlugin("warn", `[serve] receipt failed status=${res.status}${reason ? ` reason=${reason}` : ""} cid_fp=${fp8(mem.cid)}`, serveTrace)
+            })
+            .catch((err) => {
+              logPlugin("warn", `[serve] receipt failed reason=${excerpt(err instanceof Error ? err.message : String(err), 200)} cid_fp=${fp8(mem.cid)}`, serveTrace)
+            })
         }
       }
       upsertServedMemories(newlyServed.map(m => ({ cid: m.cid, text: m.text })), sid)
@@ -1728,6 +1917,13 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           output.context.unshift(injectState.blocks[index])
         }
       }
+      const restoreCount = (compactionRestoreCounts.get(sid) ?? 0) + 1
+      compactionRestoreCounts.set(sid, restoreCount)
+      logPlugin(
+        "info",
+        `[inject] restored count=${restoredBlocks} block_chars=${restoredChars} sid=${sid} cadence=once compaction_restores=${restoreCount}`,
+        newTrace(),
+      )
     },
 
     event: async (input) => {
@@ -1742,10 +1938,88 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           logPlugin("info", `[lifecycle] event type=${eventType}`, newTrace())
         }
       }
+
+      if (sensorsEnabled) {
+        spoolFromEvent(input.event)
+
+        const properties = (input.event as { properties?: Record<string, unknown> } | undefined)?.properties
+        const info = properties?.info && typeof properties.info === "object"
+          ? properties.info as Record<string, unknown>
+          : undefined
+        const sidRaw = properties?.sessionID ?? info?.id
+        const sid = typeof sidRaw === "string" && sidRaw.length > 0 ? sidRaw : currentSessionId()
+        const gstvDeps: GstvHookDeps = {
+          spool,
+          mcpBase: WEVIBE_MCP_HTTP,
+          repoRoot: sensorRepoRoot,
+          token: readWeVibeMcpToken(),
+          newTrace,
+          runCommand,
+        }
+
+        if (eventType === "session.created") {
+          void onSessionCreated(gstvDeps, sid).catch(err => {
+            logPlugin("error", `[gstv] session.created hook failed: ${excerpt(err instanceof Error ? err.message : String(err), 200)}`, newTrace())
+          })
+        }
+
+        if (eventType === "session.idle") {
+          void onSessionIdle(gstvDeps, sid, gstvBoundaryRan).catch(err => {
+            logPlugin("error", `[gstv] session.idle hook failed: ${excerpt(err instanceof Error ? err.message : String(err), 200)}`, newTrace())
+          })
+        }
+      }
+    },
+
+    "tool.execute.before": async (input, output) => {
+      if (!sensorsEnabled) {
+        return
+      }
+
+      if (toolCallStartedAt.size > 4096) {
+        toolCallStartedAt.clear()
+      }
+      toolCallStartedAt.set(input.callID, Date.now())
+      const argsExcerpt = excerpt(output?.args)
+      spool.append({
+        sessionId: input.sessionID ?? currentSessionId(),
+        event: "tool.execute.before",
+        payload: {
+          call_id: input.callID,
+          tool: input.tool,
+          ...(argsExcerpt ? { args_excerpt: argsExcerpt } : {}),
+        },
+      })
     },
 
     "tool.execute.after": async (input, output) => {
       metricsRecorder.handleToolAfter(input, output)
+
+      if (!sensorsEnabled) {
+        return
+      }
+
+      const startedAt = toolCallStartedAt.get(input.callID)
+      toolCallStartedAt.delete(input.callID)
+      const durationMs = typeof startedAt === "number" ? Math.max(0, Date.now() - startedAt) : undefined
+      const metadata = output?.metadata as { exit_code?: unknown; exitCode?: unknown; error?: unknown } | undefined
+      const exitCodeRaw = metadata?.exit_code ?? metadata?.exitCode
+      const outputExcerpt = excerpt(output?.output)
+      const errorExcerpt = typeof metadata?.error === "string" && metadata.error.trim().length > 0
+        ? excerpt(metadata.error)
+        : undefined
+      spool.append({
+        sessionId: input.sessionID ?? currentSessionId(),
+        event: "tool.execute.after",
+        payload: {
+          call_id: input.callID,
+          tool: input.tool,
+          ...(typeof durationMs === "number" ? { duration_ms: durationMs } : {}),
+          ...(typeof exitCodeRaw === "number" ? { exit_code: exitCodeRaw } : {}),
+          ...(outputExcerpt ? { output_excerpt: outputExcerpt } : {}),
+          ...(errorExcerpt ? { error_excerpt: errorExcerpt } : {}),
+        },
+      })
     },
   }
 }
