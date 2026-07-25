@@ -609,8 +609,9 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     const line = `${new Date().toISOString()} [${level}]${trace ? ` trace=${trace}` : ""} ${message}`
     try {
       appendFileSync(errorLogPath, `${line}\n`)
-    } catch {
+    } catch (err) {
       // best-effort logging only
+      console.error("wevibe-plugin log sink write failed:", err)
     }
     if (client?.app?.log) {
       void client.app.log({
@@ -1955,6 +1956,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           token: readWeVibeMcpToken(),
           newTrace,
           runCommand,
+          log: logPlugin,
         }
 
         if (eventType === "session.created") {

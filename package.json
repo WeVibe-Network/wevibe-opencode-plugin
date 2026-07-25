@@ -25,7 +25,8 @@
     "uninstall-opencode": "tsx bin/install-opencode.ts uninstall-opencode"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "1.4.10"
+    "@opencode-ai/plugin": "1.4.10",
+    "@opencode-ai/sdk": "1.4.10"
   },
   "devDependencies": {
     "@opentui/core": "0.4.1",

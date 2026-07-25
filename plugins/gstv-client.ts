@@ -32,6 +32,7 @@ export async function fetchGstvGoal(opts: {
   traceId: string
   timeoutMs?: number
   fetchFn?: typeof fetch
+  log?: (level: "info" | "warn" | "error", message: string, trace?: string) => void
 }): Promise<GstvGoal | null> {
   const fetchImpl = opts.fetchFn ?? fetch
   const url = `${opts.mcpBase}/v1/gstv/goal?repo_root=${encodeURIComponent(opts.repoRoot)}`
@@ -105,7 +106,8 @@ export async function fetchGstvGoal(opts: {
       needs_boundary_run: payload.needs_boundary_run,
       boundary_reason: payload.boundary_reason,
     }
-  } catch {
+  } catch (err) {
+    opts.log?.("error", `[gstv] goal fetch failed: ${err instanceof Error ? err.message : String(err)}`, opts.traceId)
     return null
   }
 }

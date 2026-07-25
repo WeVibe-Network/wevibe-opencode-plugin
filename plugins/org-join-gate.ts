@@ -9,8 +9,14 @@ export interface OrgMembershipSignal {
   hasKnownOrg: boolean
 }
 
+interface IdentitySidecar {
+  ed25519PublicKey?: unknown
+  adoptedAt?: unknown
+  orgs?: Record<string, unknown> | null
+}
+
 /** Derive membership signal from the parsed ~/.wevibe/identity.json sidecar (or null). */
-export function deriveOrgMembership(sidecar: any): OrgMembershipSignal {
+export function deriveOrgMembership(sidecar: IdentitySidecar | null | undefined): OrgMembershipSignal {
   const identityPresent = !!sidecar?.ed25519PublicKey
   const adopted = sidecar?.adoptedAt != null
   const orgs = sidecar?.orgs

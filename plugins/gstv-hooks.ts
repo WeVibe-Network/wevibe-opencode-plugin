@@ -11,6 +11,7 @@ export interface GstvHookDeps {
   newTrace: () => string
   runCommand: (command: string, timeoutMs: number) => Promise<{ exitCode: number; durationMs: number }>
   fetchFn?: typeof fetch
+  log?: (level: "info" | "warn" | "error", message: string, trace?: string) => void
 }
 
 export async function onSessionCreated(deps: GstvHookDeps, sessionId: string): Promise<void> {
@@ -22,6 +23,7 @@ export async function onSessionCreated(deps: GstvHookDeps, sessionId: string): P
       token: deps.token,
       traceId: trace,
       fetchFn: deps.fetchFn,
+      log: deps.log,
     })
 
     if (goal?.open) {
@@ -32,7 +34,8 @@ export async function onSessionCreated(deps: GstvHookDeps, sessionId: string): P
         payload: { goal_id: goal.goal_id },
       })
     }
-  } catch {
+  } catch (err) {
+    deps.log?.("error", `[gstv] onSessionCreated hook failed: ${err instanceof Error ? err.message : String(err)}`)
     // Never throw from passive sensor hooks.
   }
 }
@@ -46,6 +49,7 @@ export async function onSessionIdle(deps: GstvHookDeps, sessionId: string, bound
       token: deps.token,
       traceId: trace,
       fetchFn: deps.fetchFn,
+      log: deps.log,
     })
 
     if (!goal?.open || !goal.needs_boundary_run || boundaryRan.has(goal.goal_id)) {
@@ -71,7 +75,8 @@ export async function onSessionIdle(deps: GstvHookDeps, sessionId: string, bound
         duration_ms: result.durationMs,
       },
     })
-  } catch {
+  } catch (err) {
+    deps.log?.("error", `[gstv] onSessionIdle hook failed: ${err instanceof Error ? err.message : String(err)}`)
     // Never throw from passive sensor hooks.
   }
 }
