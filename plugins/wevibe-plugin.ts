@@ -795,6 +795,39 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         deniedCids.add(decision.memoryID)
         reportedCids.delete(decision.memoryID)
 
+        const noteToken = readWeVibeMcpToken()
+        if (noteToken && bindingState.active && bindingState.orgId) {
+          const boundOrg = bindingState.orgId
+          const noteTrace = newTrace()
+          logPlugin("info", `[decision-note] deny memory_fp=${fp8(decision.memoryID)}`, noteTrace)
+          fetch(`${WEVIBE_MCP_HTTP}/v1/decision-notes`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${noteToken}`,
+              "X-WeVibe-Trace-Id": noteTrace,
+            },
+            body: JSON.stringify({
+              org_id: boundOrg,
+              memory_hash: decision.memoryID,
+              action: "deny",
+              ...(decision.reason ? { reason: decision.reason } : {}),
+            }),
+            signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          })
+            .then(async (res) => {
+              if (res.ok) return
+              let reason = ""
+              try { reason = excerpt((await res.text()).slice(0, 512), 200) ?? "" } catch {
+                // best effort
+              }
+              logPlugin("warn", `[decision-note] deny note failed status=${res.status}${reason ? ` reason=${reason}` : ""} memory_fp=${fp8(decision.memoryID)}`, noteTrace)
+            })
+            .catch((err) => {
+              logPlugin("warn", `[decision-note] deny note failed reason=${excerpt(err instanceof Error ? err.message : String(err), 200)} memory_fp=${fp8(decision.memoryID)}`, noteTrace)
+            })
+        }
+
         continue
       }
 

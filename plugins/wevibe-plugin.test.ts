@@ -11,18 +11,23 @@ type FetchCall = {
   url: string
   method: string
   bodyText?: string
+  headers?: Record<string, unknown>
 }
 
 type Harness = {
   hooks: Record<string, (input: unknown, output: unknown) => Promise<void>>
   calls: FetchCall[]
   appLogs: unknown[]
+  worktree: string
+  decisionsPath: string
+  statusPath: string
   logFilePath?: string
   cleanup: () => void
 }
 
 type SetupHarnessOptions = {
   recallResponder?: (call: FetchCall) => Response | Promise<Response>
+  decisionNoteResponder?: (call: FetchCall) => Response | Promise<Response>
   captureLogFile?: boolean
 }
 
@@ -115,6 +120,8 @@ const setupHarness = async (
   const worktree = mkdtempSync(join(tmpdir(), 'wevibe-plugin-worktree-'));
   const logDir = join(homeDir, 'plugin-logs');
   const logFilePath = join(logDir, 'wevibe-plugin-errors.log');
+  const decisionsPath = join(worktree, '.wevibe', 'state', 'wevibe-plugin-decisions.json');
+  const statusPath = join(worktree, '.wevibe', 'state', 'wevibe-plugin-status.json');
 
   writeBoundMarker(worktree);
   writeSessionToken(homeDir);
@@ -135,16 +142,28 @@ const setupHarness = async (
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     const method = (init?.method ?? (typeof input === 'string' || input instanceof URL ? 'GET' : input.method) ?? 'GET').toUpperCase();
     const bodyText = readBodyText(init?.body);
-    calls.push({ url, method, bodyText });
+    const headers = init?.headers instanceof Headers
+      ? Object.fromEntries(init.headers.entries()) as Record<string, unknown>
+      : init?.headers && typeof init.headers === 'object' && !Array.isArray(init.headers)
+        ? init.headers as Record<string, unknown>
+        : undefined;
+    const call = { url, method, bodyText, headers };
+    calls.push(call);
 
     if (url.endsWith('/v1/health')) {
       return toJsonResponse(200, { status: 'ok' });
     }
     if (url.endsWith('/v1/recall')) {
       if (options.recallResponder) {
-        return options.recallResponder({ url, method, bodyText });
+        return options.recallResponder(call);
       }
       return toJsonResponse(200, recallPayload(memories));
+    }
+    if (url.endsWith('/v1/decision-notes')) {
+      if (options.decisionNoteResponder) {
+        return options.decisionNoteResponder(call);
+      }
+      return toJsonResponse(200, { status: 'ok' });
     }
     if (url.endsWith('/v1/serves')) {
       return toJsonResponse(200, { status: 'ok' });
@@ -202,6 +221,9 @@ const setupHarness = async (
     hooks: plugin as unknown as Record<string, (input: unknown, output: unknown) => Promise<void>>,
     calls,
     appLogs,
+    worktree,
+    decisionsPath,
+    statusPath,
     ...(options.captureLogFile ? { logFilePath } : {}),
     cleanup,
   };
@@ -240,6 +262,38 @@ const waitForRecallCount = async (calls: FetchCall[], expected: number): Promise
   }
   throw new Error(`Timed out waiting for ${expected} recall calls`);
 };
+
+const decisionNoteCalls = (calls: FetchCall[]): FetchCall[] => calls.filter(call => call.url.endsWith('/v1/decision-notes'));
+
+const appLogMessages = (appLogs: unknown[]): string[] =>
+  appLogs
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return '';
+      const body = (entry as { body?: { message?: unknown } }).body;
+      return typeof body?.message === 'string' ? body.message : '';
+    })
+    .filter(message => message.length > 0);
+
+const waitForAppLog = async (appLogs: unknown[], pattern: RegExp): Promise<void> => {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if (appLogMessages(appLogs).some(message => pattern.test(message))) {
+      return;
+    }
+    await sleep(25);
+  }
+  throw new Error(`Timed out waiting for app log matching ${pattern.toString()}`);
+};
+
+const writeDecisions = (
+  harness: Harness,
+  decisions: Array<{ memoryID: string; action: 'accept' | 'deny' | 'block' | 'report'; reason?: string; note?: string; timestamp: number }>,
+): void => {
+  writeFileSync(harness.decisionsPath, JSON.stringify(decisions), 'utf8');
+};
+
+const readDecisions = (harness: Harness): unknown => JSON.parse(readFileSync(harness.decisionsPath, 'utf8'));
+
+const readStatus = (harness: Harness): unknown => JSON.parse(readFileSync(harness.statusPath, 'utf8'));
 
 const serveBodies = (calls: FetchCall[]): Array<Record<string, unknown>> =>
   calls
@@ -539,17 +593,11 @@ test('emits funnel recall_fired and recall_returned line shapes with matching tr
   await waitForRecallCount(calls, 2);
   await sleep(50);
 
-  const appLogMessages = appLogs
-    .map((entry) => {
-      if (!entry || typeof entry !== 'object') return '';
-      const body = (entry as { body?: { message?: unknown } }).body;
-      return typeof body?.message === 'string' ? body.message : '';
-    })
-    .filter(message => message.length > 0);
+  const messages = appLogMessages(appLogs);
 
-  assert.ok(appLogMessages.some(message => /recall_fired trigger=user_message sid=\S+/.test(message)));
-  assert.ok(appLogMessages.some(message => /recall_fired trigger=tool_failure sid=\S+/.test(message)));
-  assert.ok(appLogMessages.some(message => /recall_returned status=\S+ count=\d+ reason_code=\S+ dur_ms=\d+ error=\S+/.test(message)));
+  assert.ok(messages.some(message => /recall_fired trigger=user_message sid=\S+/.test(message)));
+  assert.ok(messages.some(message => /recall_fired trigger=tool_failure sid=\S+/.test(message)));
+  assert.ok(messages.some(message => /recall_returned status=\S+ count=\d+ reason_code=\S+ dur_ms=\d+ error=\S+/.test(message)));
 
   assert.ok(logFilePath);
   const logText = existsSync(logFilePath) ? readFileSync(logFilePath, 'utf8') : '';
@@ -568,4 +616,110 @@ test('emits funnel recall_fired and recall_returned line shapes with matching tr
   const toolFailureTrace = (toolFailureLine?.match(/trace=([0-9a-f]{8})/) ?? [])[1];
   assert.equal(typeof toolFailureTrace, 'string');
   assert.ok(returnedLines.some(line => line.includes(`trace=${toolFailureTrace}`)));
+});
+
+test('posts a decision-note on deny with org, memory hash, and reason', { concurrency: false }, async (t) => {
+  const harness = await setupHarness([], { recall_max_injected: 10, inject_char_budget: 8000 });
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls } = harness;
+  const sessionID = 'session-decision-note-deny-reason';
+
+  await triggerRecall(hooks, calls, sessionID);
+  writeDecisions(harness, [{ memoryID: 'cid-deny-1', action: 'deny', reason: 'not relevant', timestamp: Date.now() }]);
+
+  await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
+
+  const noteCalls = decisionNoteCalls(calls);
+  assert.equal(noteCalls.length, 1);
+  assert.equal(noteCalls[0].method, 'POST');
+  assert.deepEqual(JSON.parse(noteCalls[0].bodyText ?? '{}'), {
+    org_id: 'org-test',
+    memory_hash: 'cid-deny-1',
+    action: 'deny',
+    reason: 'not relevant',
+  });
+
+  assert.equal(noteCalls[0].headers?.Authorization, 'Bearer token-test');
+  const traceId = noteCalls[0].headers?.['X-WeVibe-Trace-Id'];
+  assert.equal(typeof traceId, 'string');
+  assert.match(traceId as string, /^[0-9a-f]{8}$/);
+
+  assert.ok(appLogMessages(harness.appLogs).some(message => /\[decision-note\] deny memory_fp=/.test(message)));
+  assert.deepEqual(readDecisions(harness), []);
+
+  const status = readStatus(harness) as { denied?: string[] };
+  assert.ok(status.denied?.includes('cid-deny-1'));
+});
+
+test('omits reason on the decision-note when the deny carries none', { concurrency: false }, async (t) => {
+  const harness = await setupHarness([], { recall_max_injected: 10, inject_char_budget: 8000 });
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls } = harness;
+  const sessionID = 'session-decision-note-deny-no-reason';
+
+  await triggerRecall(hooks, calls, sessionID);
+  writeDecisions(harness, [{ memoryID: 'cid-deny-2', action: 'deny', timestamp: Date.now() }]);
+
+  await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
+
+  const noteCalls = decisionNoteCalls(calls);
+  assert.equal(noteCalls.length, 1);
+  assert.deepEqual(JSON.parse(noteCalls[0].bodyText ?? '{}'), {
+    org_id: 'org-test',
+    memory_hash: 'cid-deny-2',
+    action: 'deny',
+  });
+
+  const status = readStatus(harness) as { denied?: string[] };
+  assert.ok(status.denied?.includes('cid-deny-2'));
+});
+
+test('logs but does not fail the deny when the decision-note endpoint returns non-2xx', { concurrency: false }, async (t) => {
+  const harness = await setupHarness(
+    [],
+    { recall_max_injected: 10, inject_char_budget: 8000 },
+    { decisionNoteResponder: () => toJsonResponse(500, { error: 'mcp exploded' }) },
+  );
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls } = harness;
+  const sessionID = 'session-decision-note-deny-500';
+
+  await triggerRecall(hooks, calls, sessionID);
+  writeDecisions(harness, [{ memoryID: 'cid-deny-3', action: 'deny', reason: 'bad status', timestamp: Date.now() }]);
+
+  await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
+  await waitForAppLog(harness.appLogs, /\[decision-note\] deny note failed status=500/);
+
+  assert.deepEqual(readDecisions(harness), []);
+  const status = readStatus(harness) as { denied?: string[] };
+  assert.ok(status.denied?.includes('cid-deny-3'));
+});
+
+test('logs but does not fail the deny when the decision-note fetch throws', { concurrency: false }, async (t) => {
+  const harness = await setupHarness(
+    [],
+    { recall_max_injected: 10, inject_char_budget: 8000 },
+    {
+      decisionNoteResponder: () => {
+        throw new Error('connect ECONNREFUSED');
+      },
+    },
+  );
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls } = harness;
+  const sessionID = 'session-decision-note-deny-fetch-throw';
+
+  await triggerRecall(hooks, calls, sessionID);
+  writeDecisions(harness, [{ memoryID: 'cid-deny-4', action: 'deny', reason: 'network fail', timestamp: Date.now() }]);
+
+  await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
+  await waitForAppLog(harness.appLogs, /\[decision-note\] deny note failed reason=.*ECONNREFUSED/);
+
+  assert.deepEqual(readDecisions(harness), []);
+  const status = readStatus(harness) as { denied?: string[] };
+  assert.ok(status.denied?.includes('cid-deny-4'));
 });
