@@ -2,8 +2,9 @@
 //
 // Additive session-benchmark recorder for the WeVibe OpenCode plugin.
 // Computes objective per-session metrics from OpenCode telemetry and writes a
-// timestamped JSONL live-log under runs/ (R-31 live-log convention). Additive
-// only: it observes events + tool outputs and never influences recall/injection.
+// timestamped JSONL live-log under runs/ (R-31 live-log convention). It observes
+// events + tool outputs, and its exported signals now also gate need-based
+// recall firing via pure recall-need assessment.
 //
 // No secrets/PII: only booleans, counts, sessionID, timestamps and a coarse
 // detection category are logged — never raw commands or tool output.
@@ -134,6 +135,69 @@ function classify(
   if (FAILURE_RE.test(text)) return { category, result: "failure" }
   if (SUCCESS_RE.test(text)) return { category, result: "success" }
   return { category, result: "unknown" }
+}
+
+export interface RecallNeedInput {
+  tool: string
+  command?: string
+  exitCode: number | null
+  pre: { buildFailing?: boolean; testFailing?: boolean }
+  post: { buildFailing?: boolean; testFailing?: boolean }
+  recentErrors: string[]
+  lastFiredSignature: string
+}
+
+export type RecallNeedTrigger = "exit_nonzero" | "build_transition" | "test_transition" | "new_errors"
+
+export interface RecallNeed {
+  needed: boolean
+  triggers: RecallNeedTrigger[]
+  query: string
+  signature: string
+}
+
+export function extractToolExitCode(metadata: unknown): number | null {
+  if (!metadata || typeof metadata !== "object") return null
+  const record = metadata as Record<string, unknown>
+  const candidates = [record.exit, record.exit_code, record.exitCode]
+  for (const value of candidates) {
+    if (typeof value === "number" && Number.isFinite(value)) return value
+  }
+  return null
+}
+
+export function assessRecallNeed(input: RecallNeedInput): RecallNeed {
+  const triggers: RecallNeedTrigger[] = []
+
+  if (input.exitCode !== null && input.exitCode !== 0) triggers.push("exit_nonzero")
+  if (input.post.buildFailing === true && input.pre.buildFailing !== true) triggers.push("build_transition")
+  if (input.post.testFailing === true && input.pre.testFailing !== true) triggers.push("test_transition")
+
+  const hasNewErrors = input.recentErrors.some((error) => error.length > 0 && !input.lastFiredSignature.includes(error))
+  if (hasNewErrors) triggers.push("new_errors")
+
+  if (triggers.length === 0) {
+    return { needed: false, triggers: [], query: "", signature: "" }
+  }
+
+  const label = triggers.includes("build_transition") ? "build failing" : triggers.includes("test_transition") ? "test failing" : "tool failure"
+
+  const parts: string[] = [label]
+  const trimmedCommand = typeof input.command === "string" ? input.command.trim() : ""
+  if (trimmedCommand) parts.push(trimmedCommand.slice(0, 120))
+
+  const recent = input.recentErrors.slice(Math.max(0, input.recentErrors.length - 3))
+  for (const error of recent) {
+    parts.push(error.slice(0, 180))
+  }
+
+  const query = parts
+    .join(" | ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 500)
+
+  return { needed: true, triggers, query, signature: query }
 }
 
 // --- recorder ----------------------------------------------------------------
