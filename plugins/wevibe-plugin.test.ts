@@ -29,6 +29,7 @@ type SetupHarnessOptions = {
   recallResponder?: (call: FetchCall) => Response | Promise<Response>
   decisionNoteResponder?: (call: FetchCall) => Response | Promise<Response>
   captureLogFile?: boolean
+  recallMode?: 'test' | 'prod'
 }
 
 type RecallMemory = {
@@ -128,7 +129,7 @@ const setupHarness = async (
   writePluginConfig(homeDir, config);
 
   process.env.HOME = homeDir;
-  process.env.WEVIBE_RECALL_MODE = 'test';
+  process.env.WEVIBE_RECALL_MODE = options.recallMode ?? 'test';
   process.env.WEVIBE_MCP_HTTP_URL = 'http://wevibe-mock:4450';
   if (options.captureLogFile) {
     process.env.WEVIBE_LOG_DIR = logDir;
@@ -359,6 +360,41 @@ test('injects at index 0 when output.system starts empty', { concurrency: false 
 
   assert.equal(output.system.length, 1);
   assert.ok(output.system[0].includes('## Team Memory (WeVibe Network)'));
+});
+
+test('prod recall mode drains accept decisions into approved and injects them via transform', { concurrency: false }, async (t) => {
+  const memory = { cid: 'cid-prod-accept', text: 'Accepted in prod mode' };
+  const harness = await setupHarness(
+    [memory],
+    { recall_max_injected: 10, inject_char_budget: 8000 },
+    { recallMode: 'prod' },
+  );
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls, appLogs, worktree } = harness;
+  const sessionID = 'session-prod-accept-drain';
+
+  await triggerRecall(hooks, calls, sessionID);
+
+  const preDecisionOutput = { system: ['base system instruction'] };
+  await hooks['experimental.chat.system.transform']({ sessionID }, preDecisionOutput);
+  const preDecisionLogs = appLogMessages(appLogs);
+  assert.ok(preDecisionLogs.some(message => message.includes('[inject]') && message.includes('nothing injected') && message.includes('approved=0')));
+  assert.equal(preDecisionOutput.system.length, 1);
+
+  const stateDir = join(worktree, '.wevibe', 'state');
+  writeFileSync(join(stateDir, 'wevibe-tui-active.json'), JSON.stringify({ ts: Date.now() }), 'utf8');
+  writeDecisions(harness, [{ memoryID: memory.cid, action: 'accept', reason: '', note: '', timestamp: Date.now() }]);
+
+  const output = { system: ['base system instruction'] };
+  await hooks['experimental.chat.system.transform']({ sessionID }, output);
+
+  assert.equal(output.system.length, 2);
+  assert.ok(output.system[1].includes('## Team Memory (WeVibe Network)'));
+  assert.ok(output.system[1].includes(memory.text));
+  assert.deepEqual(readDecisions(harness), []);
+  const postDecisionLogs = appLogMessages(appLogs);
+  assert.ok(postDecisionLogs.some(message => message.includes('[inject] injected count=1')));
 });
 
 test('budget cap skips oversized memory, continues to inject fitting later memory, and never serves oversized memory on later turns', { concurrency: false }, async (t) => {
