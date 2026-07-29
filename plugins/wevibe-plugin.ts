@@ -3,12 +3,14 @@ import { join, resolve, dirname, basename } from "path"
 import { homedir } from "os"
 import { fileURLToPath } from "node:url"
 import { createHash, randomUUID } from "node:crypto"
-import { SessionMetricsRecorder, assessRecallNeed, extractToolExitCode } from "./metrics"
+import { SessionMetricsRecorder, assessRecallNeed, extractToolExitCode, type RecallNeedTrigger } from "./metrics"
 import { buildRecallHarvest, type RecallHarvestSignals } from "./recall-harvest"
 import { detectBinding, type BindingState } from "./binding"
 import { resolveScopedWeVibeDir, scopedLogDir, scopedRunsDir, scopedStateDir } from "./wevibe-paths"
 import { createSpool, excerpt, fp8, type Spool } from "./gstv-spool"
 import { GSTV_BOUNDARY_TIMEOUT_MS, onSessionCreated, onSessionIdle, type GstvHookDeps } from "./gstv-hooks"
+import { EpisodeTracker, type HarvestedOutcome } from "./outcome-episode"
+import { createOutcomeSpool } from "./outcome-spool"
 
 interface CachedMemory {
   cid: string
@@ -530,6 +532,12 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   })
   const gstvBoundaryRan = new Set<string>()
   const toolCallStartedAt = new Map<string, number>()
+  type LatestNeedState = {
+    signature: string
+    triggers: RecallNeedTrigger[]
+    failing: { build: boolean; test: boolean }
+  }
+  const latestNeedBySession = new Map<string, LatestNeedState>()
 
   ensureFile(queuePath, "[]\n")
   ensureFile(decisionPath, "[]\n")
@@ -610,6 +618,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   function logPlugin(level: "info" | "warn" | "error", message: string, trace?: string): void {
     const line = `${new Date().toISOString()} [${level}]${trace ? ` trace=${trace}` : ""} ${message}`
     try {
+      mkdirSync(logDir, { recursive: true })
       appendFileSync(errorLogPath, `${line}\n`)
     } catch (err) {
       // best-effort logging only
@@ -1022,6 +1031,30 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     } catch {
       return null
     }
+  }
+
+  const episodeTracker = new EpisodeTracker({
+    onDrop: (cid, reason) => logPlugin("warn", `[outcome] dropped cid_fp=${fp8(cid)} reason=${reason}`, newTrace()),
+  })
+  const outcomeSpool = createOutcomeSpool({
+    stateDir,
+    mcpBase: WEVIBE_MCP_HTTP,
+    getToken: readWeVibeMcpToken,
+    getOrgActive: () => bindingState.active && !!bindingState.orgId,
+    newTrace,
+    log: (level, msg, trace) => logPlugin(level === "debug" ? "info" : level, msg, trace),
+    requestTimeoutMs: REQUEST_TIMEOUT_MS,
+  })
+  const stopOutcomeLoop = outcomeSpool.startBackgroundLoop(15_000)
+  void stopOutcomeLoop
+
+  const enqueueHarvestedOutcomes = (sid: string, outcomes: HarvestedOutcome[]): void => {
+    if (outcomes.length === 0) return
+    for (const outcome of outcomes) {
+      outcomeSpool.enqueue(outcome)
+    }
+    const worked = outcomes.some(outcome => outcome.worked)
+    logPlugin("info", `[outcome] harvested n=${outcomes.length} worked=${worked} sid=${sid} episode_fp=${fp8(outcomes[0]?.episodeRef ?? "")}`, newTrace())
   }
 
   async function ensureWeVibeMcpRunning(): Promise<boolean> {
@@ -1889,6 +1922,23 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         injectTrace,
       )
 
+      const latestNeed = latestNeedBySession.get(sid)
+      if (!bindingState.orgId) {
+        logDebug(`[outcome] open skipped org=missing sid=${sid}`)
+      } else if (latestNeed) {
+        enqueueHarvestedOutcomes(sid, episodeTracker.openEpisode({
+          orgId: bindingState.orgId,
+          sessionId: sid,
+          needSignature: latestNeed.signature,
+          injectedCids: newlyServed.map(memory => memory.cid),
+          triggers: latestNeed.triggers,
+          failing: latestNeed.failing,
+          openedAtTurn: 0,
+        }))
+      } else {
+        logDebug(`[outcome] open skipped need=missing sid=${sid}`)
+      }
+
       if (getRecallMode() === "test" && newlyServed.length > 0) {
         void client?.tui?.showToast?.({
           body: {
@@ -2004,6 +2054,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         }
 
         if (eventType === "session.idle") {
+          enqueueHarvestedOutcomes(sid, episodeTracker.onSessionIdle(sid))
           void onSessionIdle(gstvDeps, sid, gstvBoundaryRan).catch(err => {
             logPlugin("error", `[gstv] session.idle hook failed: ${excerpt(err instanceof Error ? err.message : String(err), 200)}`, newTrace())
           })
@@ -2036,24 +2087,50 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       const needSessionId = input.sessionID ?? currentSessionId()
       const preNeedSignals = metricsRecorder.getBuildTestSignals(needSessionId)
       metricsRecorder.handleToolAfter(input, output)
+      const postNeedSignals = metricsRecorder.getBuildTestSignals(needSessionId)
+      const argsRecord = input.args as { command?: unknown } | undefined
+      const command = typeof argsRecord?.command === "string" ? argsRecord.command : ""
+      const exitCode = extractToolExitCode(output?.metadata)
 
       // Need-gated recall firing: failure signals only; dedup via recallInFlight + lastRecalledQuery.
       if (wevibeAvailable && bindingState.active && !recallInFlight) {
-        const argsRecord = input.args as { command?: unknown } | undefined
         const need = assessRecallNeed({
           tool: input.tool,
-          command: typeof argsRecord?.command === "string" ? argsRecord.command : undefined,
-          exitCode: extractToolExitCode(output?.metadata),
+          command: command || undefined,
+          exitCode,
           pre: preNeedSignals,
-          post: metricsRecorder.getBuildTestSignals(needSessionId),
+          post: postNeedSignals,
           recentErrors: metricsRecorder.getRecentErrors(needSessionId),
           lastFiredSignature: lastRecalledQuery,
         })
         if (need.needed && need.signature !== lastRecalledQuery) {
+          latestNeedBySession.set(needSessionId, {
+            signature: need.signature,
+            triggers: need.triggers,
+            failing: {
+              build: postNeedSignals.buildFailing === true,
+              test: postNeedSignals.testFailing === true,
+            },
+          })
           lastRecalledQuery = need.signature
           triggerRecall(need.query, "tool_failure")
         }
       }
+
+      enqueueHarvestedOutcomes(needSessionId, episodeTracker.observeToolResult({
+        sessionId: needSessionId,
+        tool: input.tool,
+        commandFp8: fp8(command || ""),
+        exitCode,
+        pre: {
+          buildFailing: preNeedSignals.buildFailing === true,
+          testFailing: preNeedSignals.testFailing === true,
+        },
+        post: {
+          buildFailing: postNeedSignals.buildFailing === true,
+          testFailing: postNeedSignals.testFailing === true,
+        },
+      }))
 
       if (!sensorsEnabled) {
         return
