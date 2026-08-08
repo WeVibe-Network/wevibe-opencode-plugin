@@ -1940,6 +1940,10 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
               nullifier: mem.cid,
               matched_keywords: mem.matchedKeywords ?? [],
               session_id: sid,
+              // D-RECALL-PAIRING-TOKEN: pair this serve with its firing episode
+              // on-chain. Fail-closed like MCP intake: an episode-less serve omits
+              // episode_ref (MCP 400-rejects it — intentionally not paired).
+              ...(firedEpisode?.episodeRef ? { episode_ref: firedEpisode.episodeRef } : {}),
             }),
             signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
           })

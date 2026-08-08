@@ -1003,3 +1003,83 @@ test('bench-fixture adapter: failing-test-scoped failureKey + C3b flake guard', 
   assert.ok(episodeRefs.includes(expectedRef), 'episode_ref must match the failing-test-scoped key');
   assert.ok(!episodeRefs.includes(tripwireRef), 'must NOT fall back to the tripwire identity');
 });
+
+test('serve POST carries the firing episode episodeRef, matching the tracker-computed ref and the outcome spool', { concurrency: false }, async (t) => {
+  const harness = await setupHarness([{ cid: 'c5'.repeat(32), text: 'pairing memory' }], { recall_max_injected: 10, inject_char_budget: 8000 });
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls, worktree } = harness;
+  const sessionID = 'session-ep-ref';
+  const COMMAND = 'npm run build';
+
+  // Arms a TRIPWIRE episode (no predicate adapter; failingTest null, testId null),
+  // fires recall, caches + approves the memory.
+  await driveRepeatFailure(hooks, calls, sessionID);
+
+  // Serve the armed episode's memory.
+  await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
+
+  const serves = serveBodies(calls);
+  assert.equal(serves.length, 1);
+  assert.equal(serves[0].memory_hash, 'c5'.repeat(32));
+
+  // (a) the serve body carries the firing episode's episodeRef.
+  assert.ok(typeof serves[0].episode_ref === 'string' && serves[0].episode_ref.length > 0, 'serve body must carry episode_ref');
+
+  // (b) it equals the tracker-computed episodeRef for (org, session, failureKey).
+  const commandFp8Val = fp8(COMMAND);
+  const repoBinding = 'a'.repeat(64);
+  const tripwireKey = computeFailureKey({ repoBinding, predicateId: `cmd:${commandFp8Val}`, failingTest: null, commandFp8: commandFp8Val });
+  const expectedRef = computeEpisodeRef('org-test', sessionID, tripwireKey);
+  assert.equal(serves[0].episode_ref, expectedRef, 'serve episode_ref must equal tracker-computed episodeRef');
+
+  // Close the episode with a green to harvest its outcome.
+  await hooks['tool.execute.after'](
+    { sessionID, callID: 'ep-ref-green', tool: 'bash', args: { command: COMMAND } },
+    { title: '', output: 'ok', metadata: { exit: 0 } },
+  );
+
+  // (c) serve↔outcome pairing: the outcome spool's episode_ref is the SAME string.
+  const spoolPath = join(worktree, '.wevibe', 'state', 'outcome-spool', 'outcome-spool-v1.jsonl');
+  let spoolRefs: string[] = [];
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if (existsSync(spoolPath)) {
+      const text = readFileSync(spoolPath, 'utf8').trim();
+      spoolRefs = text.length === 0 ? [] : text.split('\n').map(line => (JSON.parse(line) as { episode_ref: string }).episode_ref);
+      if (spoolRefs.length >= 1) break;
+    }
+    await sleep(25);
+  }
+  assert.ok(spoolRefs.includes(serves[0].episode_ref), 'outcome spool episode_ref must equal serve body episode_ref');
+});
+
+test('serve POST without a firing episode omits episode_ref and does not break the transform/tripwire fallback', { concurrency: false }, async (t) => {
+  const harness = await setupHarness([{ cid: 'c6'.repeat(32), text: 'no episode memory' }], { recall_max_injected: 10, inject_char_budget: 8000 });
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls } = harness;
+  const armingSession = 'session-arms-episode';
+  const servingSession = 'session-serves-without-episode';
+
+  // Arm an episode under `armingSession` → recall fires, caches + approves the memory.
+  await driveRepeatFailure(hooks, calls, armingSession);
+
+  // Serve under a DIFFERENT session that never armed an episode: firedEpisodeBySession
+  // has no entry for the serving sid, so the serve still posts but omits episode_ref.
+  const output = { system: ['base system'] };
+  await hooks['experimental.chat.system.transform']({ sessionID: servingSession }, output);
+
+  const serves = serveBodies(calls);
+  assert.ok(serves.length >= 1, 'a serve must still post for a memory');
+  assert.ok(serves.some(s => s.memory_hash === 'c6'.repeat(32)), 'the cached memory must be served');
+
+  const noEpServes = serves.filter(s => s.memory_hash === 'c6'.repeat(32));
+  assert.ok(noEpServes.length >= 1, 'expected a serve for the no-episode memory');
+  for (const body of noEpServes) {
+    assert.equal(body.episode_ref, undefined, 'episode-less serve must NOT carry episode_ref (MCP fail-closed 400, intentionally unpaired)');
+  }
+
+  // The transform completed without throwing and injected the memory (tripwire fallback intact).
+  assert.equal(output.system.length, 2);
+  assert.ok(output.system[1].includes('## Team Memory (WeVibe Network)'));
+});
