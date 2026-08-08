@@ -189,14 +189,33 @@ const waitForSpoolRecords = async (worktree: string, count: number): Promise<Out
   return []
 }
 
+const failOutput = () => ({
+  title: "",
+  output: "error TS1234: broken",
+  metadata: { exit: 1, exit_code: 1 },
+})
+
+// C3 trigger rework: the sole recall trigger is a REPEAT failure under a stable
+// failureKey (D-RECALL-TRIGGER-REPEAT). Drive the pattern: first red opens the
+// episode, a file.edited between reds arms the C3b flake guard, and the second
+// red arms the recall. Readiness is already awaited by the caller.
+const driveRepeatFailure = async (harness: Harness, sessionID: string): Promise<void> => {
+  await harness.hooks["tool.execute.after"](
+    { sessionID, callID: `${sessionID}-fail-1`, tool: "bash", args: { command: "npm run build" } },
+    failOutput(),
+  )
+  await harness.hooks["event"]({ event: { type: "file.edited", properties: { sessionID, file: "src/x.ts" } } }, undefined)
+  await harness.hooks["tool.execute.after"](
+    { sessionID, callID: `${sessionID}-fail-2`, tool: "bash", args: { command: "npm run build" } },
+    failOutput(),
+  )
+  await waitForRecall(harness.calls)
+}
+
 const driveNeedAndInject = async (harness: Harness, sessionID: string): Promise<void> => {
   await waitForLog(harness.logs, /\[recall\] init wevibeAvailable=true/)
   await waitForLog(harness.logs, /\[binding\] session bind: active=true/)
-  await harness.hooks["tool.execute.after"](
-    { sessionID, callID: `${sessionID}-fail`, tool: "bash", args: { command: "npm run build" } },
-    { title: "", output: "error TS1234: broken", metadata: { exit: 1, exit_code: 1 } },
-  )
-  await waitForRecall(harness.calls)
+  await driveRepeatFailure(harness, sessionID)
   const output = { system: ["base system"] }
   await harness.hooks["experimental.chat.system.transform"]({ sessionID }, output)
   assert.equal(output.system.length, 2)

@@ -3,13 +3,15 @@ import { join, resolve, dirname, basename } from "path"
 import { homedir } from "os"
 import { fileURLToPath } from "node:url"
 import { createHash, randomUUID } from "node:crypto"
-import { SessionMetricsRecorder, assessRecallNeed, extractToolExitCode, type RecallNeedTrigger } from "./metrics"
+import { SessionMetricsRecorder, assessRecallNeed, extractToolExitCode } from "./metrics"
 import { buildRecallHarvest, type RecallHarvestSignals } from "./recall-harvest"
 import { detectBinding, type BindingState } from "./binding"
 import { resolveScopedWeVibeDir, scopedLogDir, scopedRunsDir, scopedStateDir } from "./wevibe-paths"
 import { createSpool, excerpt, fp8, type Spool } from "./gstv-spool"
 import { GSTV_BOUNDARY_TIMEOUT_MS, onSessionCreated, onSessionIdle, type GstvHookDeps } from "./gstv-hooks"
 import { EpisodeTracker, type HarvestedOutcome } from "./outcome-episode"
+import { computeFailureKey } from "./failure-key"
+import { resolvePredicateAdapter } from "./predicate-adapter"
 import { createOutcomeSpool } from "./outcome-spool"
 
 interface CachedMemory {
@@ -87,7 +89,7 @@ export interface SelectInjectCandidatesResult {
   budgetRemaining: number
 }
 
-export type RecallTrigger = "user_message" | "tool_failure"
+export type RecallTrigger = "repeat_failure"
 
 const memoryHeader = "## Team Memory (WeVibe Network)"
 const memoryIntro = "The following are verified technical memories from your organization."
@@ -532,12 +534,9 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   })
   const gstvBoundaryRan = new Set<string>()
   const toolCallStartedAt = new Map<string, number>()
-  type LatestNeedState = {
-    signature: string
-    triggers: RecallNeedTrigger[]
-    failing: { build: boolean; test: boolean }
-  }
-  const latestNeedBySession = new Map<string, LatestNeedState>()
+  const firedEpisodeBySession = new Map<string, { failureKey: string; episodeRef: string }>()
+  // C3b flake guard: a repeat red only arms if a file-edit occurred since the last red.
+  const editSeenBySession = new Map<string, boolean>()
 
   ensureFile(queuePath, "[]\n")
   ensureFile(decisionPath, "[]\n")
@@ -959,7 +958,6 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   }
 
   const cachedMemories: CachedMemory[] = []
-  let lastRecalledQuery = ""
   let wevibeAvailable = false
   let bindingState: BindingState = { active: false }
   let memoryCacheKey = ""
@@ -1588,31 +1586,6 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     }
   })()
 
-  const collectTextParts = (parts: unknown): string => {
-    if (!Array.isArray(parts)) {
-      return ""
-    }
-
-    const textParts: string[] = []
-    for (const part of parts) {
-      if (!part || typeof part !== "object") {
-        continue
-      }
-
-      const candidate = part as { type?: unknown; text?: unknown }
-      if (candidate.type !== "text" || typeof candidate.text !== "string") {
-        continue
-      }
-
-      const text = candidate.text.trim()
-      if (text.length > 0) {
-        textParts.push(text)
-      }
-    }
-
-    return textParts.join("\n").trim()
-  }
-
   const spoolFromEvent = (evt: unknown): void => {
     if (!sensorsEnabled) {
       return
@@ -1722,28 +1695,11 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   }
 
   return {
-    "chat.message": async (input, output) => {
+    "chat.message": async (input) => {
+      // Session tracking only. Recall never fires on user prompts
+      // (D-RECALL-TRIGGER-REPEAT): the sole trigger is a repeat failure
+      // under a stable failureKey, handled in tool.execute.after.
       if (input?.sessionID) activeSessionId = input.sessionID
-
-      // opencode's chat.message API: `input` has NO parts; `output` = { message: UserMessage, parts: Part[] }.
-      // The user's prompt text lives in output.parts (verified against @opencode-ai/plugin index.d.ts:183-195).
-      const userPromptText = collectTextParts((output as { parts?: unknown }).parts)
-      const normalizedPromptText = userPromptText.replace(/\s+/g, " ").trim()
-
-      if (normalizedPromptText.length === 0) {
-        return
-      }
-
-      if (normalizedPromptText === lastRecalledQuery) {
-        return
-      }
-
-      if (!wevibeAvailable) {
-        return
-      }
-
-      lastRecalledQuery = normalizedPromptText
-      triggerRecall(normalizedPromptText, "user_message")
     },
 
     "experimental.chat.system.transform": async (input, output) => {
@@ -1922,21 +1878,9 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         injectTrace,
       )
 
-      const latestNeed = latestNeedBySession.get(sid)
-      if (!bindingState.orgId) {
-        logDebug(`[outcome] open skipped org=missing sid=${sid}`)
-      } else if (latestNeed) {
-        enqueueHarvestedOutcomes(sid, episodeTracker.openEpisode({
-          orgId: bindingState.orgId,
-          sessionId: sid,
-          needSignature: latestNeed.signature,
-          injectedCids: newlyServed.map(memory => memory.cid),
-          triggers: latestNeed.triggers,
-          failing: latestNeed.failing,
-          openedAtTurn: 0,
-        }))
-      } else {
-        logDebug(`[outcome] open skipped need=missing sid=${sid}`)
+      const firedEpisode = firedEpisodeBySession.get(sid)
+      if (firedEpisode && newlyServed.length > 0) {
+        episodeTracker.recordServe(sid, firedEpisode.failureKey, newlyServed.map(memory => memory.cid))
       }
 
       if (getRecallMode() === "test" && newlyServed.length > 0) {
@@ -2017,6 +1961,19 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 
     event: async (input) => {
       metricsRecorder.handleEvent(input.event)
+
+      // C3b flake guard: track file edits per session so a repeat red can arm
+      // only when the agent actually edited something between reds. This runs
+      // regardless of WEVIBE_GSTV_SENSORS (the recall path is sensor-independent).
+      const rawEvt = input.event as { type?: unknown; properties?: Record<string, unknown> } | undefined
+      if (rawEvt?.type === "file.edited") {
+        const props = rawEvt.properties ?? {}
+        const info = props.info && typeof props.info === "object" ? props.info as Record<string, unknown> : undefined
+        const sidRaw = props.sessionID ?? info?.id
+        const sid = typeof sidRaw === "string" && sidRaw.length > 0 ? sidRaw : currentSessionId()
+        editSeenBySession.set(sid, true)
+      }
+
       const eventType = (input.event as { type?: unknown } | undefined)?.type
       if (eventType === "session.created") {
         refreshBindingState()
@@ -2092,44 +2049,102 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       const command = typeof argsRecord?.command === "string" ? argsRecord.command : ""
       const exitCode = extractToolExitCode(output?.metadata)
 
-      // Need-gated recall firing: failure signals only; dedup via recallInFlight + lastRecalledQuery.
-      if (wevibeAvailable && bindingState.active && !recallInFlight) {
-        const need = assessRecallNeed({
-          tool: input.tool,
-          command: command || undefined,
+      // Repeat-gated recall firing (D-RECALL-TRIGGER-REPEAT): the first red
+      // under a stable failureKey opens an episode; recall fires on the SECOND
+      // red under the same key, once per key per session.
+      const need = assessRecallNeed({
+        tool: input.tool,
+        command: command || undefined,
+        exitCode,
+        pre: preNeedSignals,
+        post: postNeedSignals,
+        recentErrors: metricsRecorder.getRecentErrors(needSessionId),
+        lastFiredSignature: "",
+      })
+      const buildTransition = postNeedSignals.buildFailing === true && preNeedSignals.buildFailing !== true
+      const testTransition = postNeedSignals.testFailing === true && preNeedSignals.testFailing !== true
+      const redObserved = (exitCode !== null && exitCode !== 0) || buildTransition || testTransition
+      // Repeat-gated recall firing. Two guards shape the arm:
+      //  - C3a cascade: when a predicate reporter names several failing ids,
+      //    only the FIRST in deterministic (sorted) order may arm recall for the
+      //    wave; the rest are marked fired so they never fire later. One arm per
+      //    red wave, never one per failing id.
+      //  - C3b flake guard: a repeat red arms only if a file-edit occurred since
+      //    the last red for the session (editSeenBySession). A repeated failure
+      //    with no edit in between is flake/noise, not a real regressing episode.
+      if (redObserved && need.needed && bindingState.orgId) {
+        const commandFp8 = fp8(command || "")
+        const tripwirePredicateId = `cmd:${commandFp8}`
+        const ctx = {
+          command,
+          output: typeof output?.output === "string" ? output.output : "",
+          metadata: (output?.metadata ?? {}) as Record<string, unknown>,
           exitCode,
-          pre: preNeedSignals,
-          post: postNeedSignals,
-          recentErrors: metricsRecorder.getRecentErrors(needSessionId),
-          lastFiredSignature: lastRecalledQuery,
-        })
-        if (need.needed && need.signature !== lastRecalledQuery) {
-          latestNeedBySession.set(needSessionId, {
-            signature: need.signature,
-            triggers: need.triggers,
-            failing: {
-              build: postNeedSignals.buildFailing === true,
-              test: postNeedSignals.testFailing === true,
-            },
+        }
+        const adapter = resolvePredicateAdapter(ctx)
+        const failingIds = adapter.extractFailingTestIds(ctx)
+        const predicateId = adapter.predicateId !== "" ? adapter.predicateId : tripwirePredicateId
+
+        // C3b flake guard: a repeat arms only if a file-edit occurred between reds.
+        const editSeen = editSeenBySession.get(needSessionId) ?? false
+        editSeenBySession.set(needSessionId, false)
+
+        const baseOpenInput = {
+          orgId: bindingState.orgId,
+          sessionId: needSessionId,
+          needSignature: need.signature,
+          triggers: need.triggers,
+          failing: { build: postNeedSignals.buildFailing === true, test: postNeedSignals.testFailing === true },
+          tool: input.tool,
+          commandFp8,
+          exitCode,
+          openedAtTurn: 0,
+        }
+
+        if (failingIds.length === 0) {
+          // TRIPWIRE (unchanged): cmd fp predicate, failingTest null, ONE key.
+          const failureKey = computeFailureKey({ repoBinding: bindingState.fingerprint ?? "", predicateId: tripwirePredicateId, failingTest: null, commandFp8 })
+          const episode = episodeTracker.openOrTouch({ ...baseOpenInput, failureKey, predicateId: tripwirePredicateId, testId: null })
+          enqueueHarvestedOutcomes(needSessionId, episode.expired)
+          if (!episode.opened && !episode.fired && editSeen && wevibeAvailable && bindingState.active && !recallInFlight) {
+            episodeTracker.markFired(needSessionId, failureKey)
+            firedEpisodeBySession.set(needSessionId, { failureKey, episodeRef: episode.episodeRef })
+            triggerRecall(need.query, "repeat_failure")
+          }
+        } else {
+          const sortedIds = [...failingIds].sort()
+          sortedIds.forEach((testId, index) => {
+            const failureKey = computeFailureKey({ repoBinding: bindingState.fingerprint ?? "", predicateId, failingTest: testId, commandFp8 })
+            const episode = episodeTracker.openOrTouch({ ...baseOpenInput, failureKey, predicateId, testId })
+            enqueueHarvestedOutcomes(needSessionId, episode.expired)
+            if (index === 0) {
+              // C3a cascade: only the FIRST failing id in deterministic order arms.
+              if (!episode.opened && !episode.fired && editSeen && wevibeAvailable && bindingState.active && !recallInFlight) {
+                episodeTracker.markFired(needSessionId, failureKey)
+                firedEpisodeBySession.set(needSessionId, { failureKey, episodeRef: episode.episodeRef })
+                triggerRecall(need.query, "repeat_failure")
+              }
+            } else {
+              // non-first failing ids: marked fired so they never fire later.
+              episodeTracker.markFired(needSessionId, failureKey)
+            }
           })
-          lastRecalledQuery = need.signature
-          triggerRecall(need.query, "tool_failure")
         }
       }
 
+      const greenCtx = { command, output: typeof output?.output === "string" ? output.output : "", metadata: (output?.metadata ?? {}) as Record<string, unknown>, exitCode }
+      const greenAdapter = resolvePredicateAdapter(greenCtx)
+      const passingIds = greenAdapter.extractPassingTestIds(greenCtx)
+      const greenPredicateId = greenAdapter.predicateId !== "" ? greenAdapter.predicateId : `cmd:${fp8(command || "")}`
       enqueueHarvestedOutcomes(needSessionId, episodeTracker.observeToolResult({
         sessionId: needSessionId,
         tool: input.tool,
+        predicateId: greenPredicateId,
         commandFp8: fp8(command || ""),
         exitCode,
-        pre: {
-          buildFailing: preNeedSignals.buildFailing === true,
-          testFailing: preNeedSignals.testFailing === true,
-        },
-        post: {
-          buildFailing: postNeedSignals.buildFailing === true,
-          testFailing: postNeedSignals.testFailing === true,
-        },
+        pre: { buildFailing: preNeedSignals.buildFailing === true, testFailing: preNeedSignals.testFailing === true },
+        post: { buildFailing: postNeedSignals.buildFailing === true, testFailing: postNeedSignals.testFailing === true },
+        ...(passingIds.length > 0 ? { passingTestIds: passingIds } : {}),
       }))
 
       if (!sensorsEnabled) {

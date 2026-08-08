@@ -10,6 +10,7 @@ import {
   type OutcomeEvidence,
   type OutcomeResolution,
 } from "./outcome-episode"
+import { computeFailureKey } from "./failure-key"
 
 const cidA = "a".repeat(64)
 const cidB = "b".repeat(64)
@@ -33,11 +34,32 @@ function assertResolved(outcomes: HarvestedOutcome[], resolution: OutcomeResolut
   }
 }
 
+const keyA = computeFailureKey({ repoBinding: "repo", predicateId: "cmd:11111111", failingTest: null, commandFp8: "11111111" })
+const keyB = computeFailureKey({ repoBinding: "repo", predicateId: "cmd:22222222", failingTest: null, commandFp8: "22222222" })
+
+function openInput(overrides: Partial<Parameters<EpisodeTracker["openOrTouch"]>[0]> = {}) {
+  return {
+    orgId: "org",
+    sessionId: "s1",
+    failureKey: keyA,
+    predicateId: "cmd:11111111",
+    testId: "testA",
+    needSignature: "need-build",
+    triggers: ["build_transition"],
+    failing: { build: true, test: false },
+    tool: "bash",
+    commandFp8: "11111111",
+    exitCode: 1,
+    openedAtTurn: 1,
+    ...overrides,
+  }
+}
+
 test("refs are deterministic with fixed preimage layouts", () => {
-  const episodePreimage = "wevibe-episode-v1\norg-1\nsession-1\nneed:build"
-  assert.equal(episodePreimage, ["wevibe-episode-v1", "org-1", "session-1", "need:build"].join("\n"))
+  const episodePreimage = "wevibe-episode-v2\norg-1\nsession-1\nfailure-key-1"
+  assert.equal(episodePreimage, ["wevibe-episode-v2", "org-1", "session-1", "failure-key-1"].join("\n"))
   const episodeExpected = sha256Hex(episodePreimage)
-  assert.equal(computeEpisodeRef("org-1", "session-1", "need:build"), episodeExpected)
+  assert.equal(computeEpisodeRef("org-1", "session-1", "failure-key-1"), episodeExpected)
   assertHex64(episodeExpected)
 
   const evidence: OutcomeEvidence = {
@@ -64,24 +86,39 @@ test("refs are deterministic with fixed preimage layouts", () => {
   assert.equal(computeEvidenceRef(nullExitEvidence), sha256Hex(nullExitPreimage))
 })
 
-test("open to build red-green resolves worked=true once per cid then closes", () => {
+test("failureKey is stable across attempts and changes with failing test identity", () => {
+  const base = { repoBinding: "repo", predicateId: "gstv:goal-1", commandFp8: "99999999" }
+  const attempt1 = computeFailureKey({ ...base, failingTest: "pkg/foo.test.ts > renders" })
+  const attempt2 = computeFailureKey({ ...base, failingTest: "pkg/foo.test.ts > renders" })
+  assert.equal(attempt1, attempt2)
+
+  const otherTest = computeFailureKey({ ...base, failingTest: "pkg/bar.test.ts > saves" })
+  assert.notEqual(attempt1, otherTest)
+
+  const tripwire = computeFailureKey({ repoBinding: "repo", predicateId: "cmd:99999999", failingTest: null, commandFp8: "99999999" })
+  assertHex64(tripwire)
+  assert.notEqual(tripwire, attempt1)
+})
+
+test("first red opens, repeat red accumulates attempts without expiring, green closes worked per served cid", () => {
   const tracker = new EpisodeTracker()
-  assert.deepEqual(
-    tracker.openEpisode({
-      orgId: "org",
-      sessionId: "s1",
-      needSignature: "need-build",
-      injectedCids: [cidA, cidB],
-      triggers: ["build_transition"],
-      failing: { build: true, test: false },
-      openedAtTurn: 1,
-    }),
-    [],
-  )
+  const first = tracker.openOrTouch(openInput())
+  assert.equal(first.opened, true)
+  assert.equal(first.attempts, 1)
+  assert.deepEqual(first.expired, [])
+
+  tracker.recordServe("s1", keyA, [cidA, cidB])
+
+  const repeat = tracker.openOrTouch(openInput({ needSignature: "need-build-attempt-2", exitCode: 1, openedAtTurn: 2 }))
+  assert.equal(repeat.opened, false)
+  assert.equal(repeat.attempts, 2)
+  assert.equal(repeat.episodeRef, first.episodeRef)
+  assert.deepEqual(repeat.expired, [])
 
   const outcomes = tracker.observeToolResult({
     sessionId: "s1",
     tool: "bash",
+    predicateId: "cmd:11111111",
     commandFp8: "11111111",
     exitCode: 0,
     pre: { buildFailing: true, testFailing: false },
@@ -93,6 +130,7 @@ test("open to build red-green resolves worked=true once per cid then closes", ()
     tracker.observeToolResult({
       sessionId: "s1",
       tool: "bash",
+      predicateId: "cmd:11111111",
       commandFp8: "11111111",
       exitCode: 0,
       pre: { buildFailing: true, testFailing: false },
@@ -104,16 +142,20 @@ test("open to build red-green resolves worked=true once per cid then closes", ()
 
 test("test red-green resolves test_green", () => {
   const tracker = new EpisodeTracker()
-  tracker.openEpisode({
-    orgId: "org",
+  tracker.openOrTouch(openInput({ sessionId: "s2", failureKey: keyB, predicateId: "cmd:22222222", commandFp8: "22222222", triggers: ["test_transition"], failing: { build: false, test: true } }))
+  tracker.recordServe("s2", keyB, [cidA])
+
+  const outcomes = tracker.observeToolResult({
     sessionId: "s2",
-    needSignature: "need-test",
-    injectedCids: [cidA],
-    triggers: ["test_transition"],
-    failing: { build: false, test: true },
-    openedAtTurn: 1,
+    tool: "bash",
+    predicateId: "cmd:22222222",
+    commandFp8: "22222222",
+    exitCode: 0,
+    pre: { buildFailing: false, testFailing: true },
+    post: { buildFailing: false, testFailing: false },
   })
 
+  assertResolved(outcomes, "worked", [cidA])
   const evidence: OutcomeEvidence = {
     kind: "test_green",
     tool: "bash",
@@ -124,76 +166,207 @@ test("test red-green resolves test_green", () => {
     postTestFailing: false,
     exitCode: 0,
   }
-  const outcomes = tracker.observeToolResult({
-    sessionId: "s2",
-    tool: "bash",
-    commandFp8: "22222222",
-    exitCode: 0,
-    pre: { buildFailing: false, testFailing: true },
-    post: { buildFailing: false, testFailing: false },
-  })
-
-  assertResolved(outcomes, "worked", [cidA])
   assert.equal(outcomes[0]?.evidenceRef, computeEvidenceRef(evidence))
 })
 
-test("command_green resolves after same tool records nonzero then exits zero", () => {
+test("green under a different predicate does not close the episode", () => {
   const tracker = new EpisodeTracker()
-  tracker.openEpisode({
-    orgId: "org",
-    sessionId: "s3",
-    needSignature: "need-command",
-    injectedCids: [cidA],
-    triggers: ["exit_nonzero"],
-    failing: { build: false, test: false },
-    openedAtTurn: 1,
-  })
-
-  assert.deepEqual(
-    tracker.observeToolResult({
-      sessionId: "s3",
-      tool: "bash",
-      commandFp8: "33333333",
-      exitCode: 2,
-      pre: { buildFailing: false, testFailing: false },
-      post: { buildFailing: false, testFailing: false },
-    }),
-    [],
-  )
-  assert.deepEqual(
-    tracker.observeToolResult({
-      sessionId: "s3",
-      tool: "read",
-      commandFp8: "33333333",
-      exitCode: 0,
-      pre: { buildFailing: false, testFailing: false },
-      post: { buildFailing: false, testFailing: false },
-    }),
-    [],
-  )
+  tracker.openOrTouch(openInput())
+  tracker.recordServe("s1", keyA, [cidA])
 
   const outcomes = tracker.observeToolResult({
-    sessionId: "s3",
+    sessionId: "s1",
     tool: "bash",
-    commandFp8: "33333333",
+    predicateId: "cmd:55555555",
+    commandFp8: "55555555",
     exitCode: 0,
     pre: { buildFailing: false, testFailing: false },
     post: { buildFailing: false, testFailing: false },
   })
+  assert.deepEqual(outcomes, [])
+})
+
+test("a changed need signature under the same failureKey does not expire the episode", () => {
+  const tracker = new EpisodeTracker()
+  tracker.openOrTouch(openInput({ needSignature: "need-attempt-1" }))
+  tracker.recordServe("s1", keyA, [cidA])
+
+  const repeat = tracker.openOrTouch(openInput({ needSignature: "need-attempt-2-different-errors", openedAtTurn: 2 }))
+  assert.equal(repeat.opened, false)
+  assert.deepEqual(repeat.expired, [])
+
+  const outcomes = tracker.observeToolResult({
+    sessionId: "s1",
+    tool: "bash",
+    predicateId: "cmd:11111111",
+    commandFp8: "11111111",
+    exitCode: 0,
+    pre: { buildFailing: true, testFailing: false },
+    post: { buildFailing: false, testFailing: false },
+  })
   assertResolved(outcomes, "worked", [cidA])
+  assert.equal(outcomes[0]?.needSignature, "need-attempt-2-different-errors")
+})
+
+test("a different failureKey opens a second concurrent episode", () => {
+  const tracker = new EpisodeTracker()
+  tracker.openOrTouch(openInput())
+  const second = tracker.openOrTouch(openInput({ failureKey: keyB, predicateId: "cmd:22222222", commandFp8: "22222222" }))
+  assert.equal(second.opened, true)
+  assert.notEqual(second.episodeRef, tracker.episodeRefFor("s1", keyA))
+
+  tracker.recordServe("s1", keyA, [cidA])
+  tracker.recordServe("s1", keyB, [cidB])
+
+  const outcomesA = tracker.observeToolResult({
+    sessionId: "s1",
+    tool: "bash",
+    predicateId: "cmd:11111111",
+    commandFp8: "11111111",
+    exitCode: 0,
+    pre: { buildFailing: true, testFailing: false },
+    post: { buildFailing: false, testFailing: false },
+  })
+  assertResolved(outcomesA, "worked", [cidA])
+})
+
+const keyTestA = computeFailureKey({ repoBinding: "repo", predicateId: "gstv:goal-1", failingTest: "testA", commandFp8: "99999999" })
+const keyTestB = computeFailureKey({ repoBinding: "repo", predicateId: "gstv:goal-1", failingTest: "testB", commandFp8: "99999999" })
+
+function testOpenInput(sessionId: string, testId: string, failureKey: string, openedAtTurn: number) {
+  return openInput({ sessionId, testId, failureKey, predicateId: "gstv:goal-1", commandFp8: "99999999", openedAtTurn })
+}
+
+test("same test id red accumulates attempts under one key (single-test semantics)", () => {
+  const tracker = new EpisodeTracker()
+  const first = tracker.openOrTouch(testOpenInput("sA", "testA", keyTestA, 1))
+  assert.equal(first.opened, true)
+  assert.equal(first.attempts, 1)
+
+  const repeat = tracker.openOrTouch(testOpenInput("sA", "testA", keyTestA, 2))
+  assert.equal(repeat.opened, false)
+  assert.equal(repeat.attempts, 2)
+  assert.equal(repeat.episodeRef, first.episodeRef)
+  assert.deepEqual(repeat.expired, [])
+})
+
+test("different test id red opens a SEPARATE episode under the same predicate", () => {
+  const tracker = new EpisodeTracker()
+  const a = tracker.openOrTouch(testOpenInput("sB", "testA", keyTestA, 1))
+  const b = tracker.openOrTouch(testOpenInput("sB", "testB", keyTestB, 1))
+  assert.equal(a.opened, true)
+  assert.equal(b.opened, true)
+  assert.notEqual(b.episodeRef, a.episodeRef)
+})
+
+test("green with passingTestIds closes ONLY the matching test episode, others stay open with attempts intact", () => {
+  const tracker = new EpisodeTracker()
+  const a = tracker.openOrTouch(testOpenInput("sC", "testA", keyTestA, 1))
+  tracker.recordServe("sC", keyTestA, [cidA])
+  const b = tracker.openOrTouch(testOpenInput("sC", "testB", keyTestB, 1))
+  tracker.recordServe("sC", keyTestB, [cidB])
+  // testB repeats a second time — attempts must survive the testA green.
+  tracker.openOrTouch(testOpenInput("sC", "testB", keyTestB, 2))
+
+  const outcomes = tracker.observeToolResult({
+    sessionId: "sC",
+    tool: "bash",
+    predicateId: "gstv:goal-1",
+    commandFp8: "99999999",
+    exitCode: 0,
+    pre: { buildFailing: true, testFailing: true },
+    post: { buildFailing: false, testFailing: true },
+    passingTestIds: ["testA"],
+  })
+  assertResolved(outcomes, "worked", [cidA])
+
+  // testB episode stays open, served cid intact, and a later green for it closes.
+  const again = tracker.observeToolResult({
+    sessionId: "sC",
+    tool: "bash",
+    predicateId: "gstv:goal-1",
+    commandFp8: "99999999",
+    exitCode: 0,
+    pre: { buildFailing: true, testFailing: true },
+    post: { buildFailing: false, testFailing: false },
+    passingTestIds: ["testB"],
+  })
+  assertResolved(again, "worked", [cidB])
+})
+
+test("green with empty/undefined passingTestIds closes every episode under the predicate (tripwire fallback)", () => {
+  const tracker = new EpisodeTracker()
+  tracker.openOrTouch(testOpenInput("sD", "testA", keyTestA, 1))
+  tracker.recordServe("sD", keyTestA, [cidA])
+  tracker.openOrTouch(testOpenInput("sD", "testB", keyTestB, 1))
+  tracker.recordServe("sD", keyTestB, [cidB])
+
+  const outcomes = tracker.observeToolResult({
+    sessionId: "sD",
+    tool: "bash",
+    predicateId: "gstv:goal-1",
+    commandFp8: "99999999",
+    exitCode: 0,
+    pre: { buildFailing: true, testFailing: true },
+    post: { buildFailing: false, testFailing: false },
+  })
+  assert.equal(outcomes.length, 2)
+  assert.deepEqual(outcomes.map((o) => o.memoryHash).sort(), [cidA, cidB])
+})
+
+test("a tripwire episode (null testId) is closed only by the predicate-scoped fallback, not a structured green", () => {
+  const tracker = new EpisodeTracker()
+  const trip = tracker.openOrTouch(openInput({ sessionId: "sE", testId: null, failureKey: keyA, predicateId: "cmd:11111111" }))
+  assert.equal(trip.opened, true)
+  tracker.recordServe("sE", keyA, [cidA])
+
+  // A structured green naming a different test must NOT close the tripwire episode.
+  const structured = tracker.observeToolResult({
+    sessionId: "sE",
+    tool: "bash",
+    predicateId: "cmd:11111111",
+    commandFp8: "11111111",
+    exitCode: 0,
+    pre: { buildFailing: true, testFailing: false },
+    post: { buildFailing: false, testFailing: false },
+    passingTestIds: ["testA"],
+  })
+  assert.deepEqual(structured, [])
+
+  // The empty-list predicate-scoped green closes it.
+  const fallback = tracker.observeToolResult({
+    sessionId: "sE",
+    tool: "bash",
+    predicateId: "cmd:11111111",
+    commandFp8: "11111111",
+    exitCode: 0,
+    pre: { buildFailing: true, testFailing: false },
+    post: { buildFailing: false, testFailing: false },
+  })
+  assertResolved(fallback, "worked", [cidA])
+})
+
+test("red with N failing tests opens N separate episodes (per-failing-test partial progress)", () => {
+  const tracker = new EpisodeTracker()
+  const keyTestC = computeFailureKey({ repoBinding: "repo", predicateId: "gstv:goal-1", failingTest: "testC", commandFp8: "99999999" })
+  const ids = ["testA", "testB", "testC"]
+  const keys = [keyTestA, keyTestB, keyTestC]
+  const refs = new Set<string>()
+  for (let i = 0; i < ids.length; i += 1) {
+    const opened = tracker.openOrTouch(testOpenInput("sF", ids[i] ?? "", keys[i] ?? "", 1))
+    assert.equal(opened.opened, true)
+    assert.equal(opened.attempts, 1)
+    const ref = tracker.episodeRefFor("sF", keys[i] ?? "")
+    assert.ok(ref, `episode ref present for ${ids[i]}`)
+    refs.add(ref ?? "")
+  }
+  assert.equal(refs.size, ids.length, "each failing test gets a distinct episode")
 })
 
 test("two idle turns expire resolution=unobserved (silence is not a vote)", () => {
   const tracker = new EpisodeTracker()
-  tracker.openEpisode({
-    orgId: "org",
-    sessionId: "s4",
-    needSignature: "need-expire",
-    injectedCids: [cidA, cidB],
-    triggers: [],
-    failing: { build: true, test: false },
-    openedAtTurn: 1,
-  })
+  tracker.openOrTouch(openInput({ sessionId: "s4" }))
+  tracker.recordServe("s4", keyA, [cidA, cidB])
 
   assert.deepEqual(tracker.onSessionIdle("s4"), [])
   const outcomes = tracker.onSessionIdle("s4")
@@ -201,44 +374,39 @@ test("two idle turns expire resolution=unobserved (silence is not a vote)", () =
   assert.deepEqual(tracker.onSessionIdle("s4"), [])
 })
 
-test("opening a superseding need closes the old episode resolution=unobserved", () => {
+test("opening beyond the per-session cap expires the oldest episode unobserved", () => {
   const tracker = new EpisodeTracker()
-  tracker.openEpisode({
-    orgId: "org",
-    sessionId: "s5",
-    needSignature: "old-need",
-    injectedCids: [cidA],
-    triggers: [],
-    failing: { build: false, test: true },
-    openedAtTurn: 1,
-  })
+  for (let i = 0; i < 8; i += 1) {
+    const fp = String(i).padStart(8, "0")
+    tracker.openOrTouch(openInput({ sessionId: "s5", failureKey: `key-${i}`, predicateId: `cmd:${fp}`, commandFp8: fp, openedAtTurn: i + 1 }))
+  }
+  tracker.recordServe("s5", "key-0", [cidA])
 
-  const expired = tracker.openEpisode({
-    orgId: "org",
-    sessionId: "s5",
-    needSignature: "new-need",
-    injectedCids: [cidB],
-    triggers: [],
-    failing: { build: false, test: false },
-    openedAtTurn: 2,
-  })
-  assertResolved(expired, "unobserved", [cidA])
-  assert.equal(expired[0]?.needSignature, "old-need")
+  const ninth = tracker.openOrTouch(openInput({ sessionId: "s5", failureKey: "key-8", predicateId: "cmd:88888888", commandFp8: "88888888", openedAtTurn: 9 }))
+  assert.equal(ninth.opened, true)
+  assertResolved(ninth.expired, "unobserved", [cidA])
+})
+
+test("markFired gates the once-per-key-per-session firing", () => {
+  const tracker = new EpisodeTracker()
+  tracker.openOrTouch(openInput())
+
+  const repeat = tracker.openOrTouch(openInput({ openedAtTurn: 2 }))
+  assert.equal(repeat.opened, false)
+  assert.equal(repeat.fired, false)
+
+  tracker.markFired("s1", keyA)
+
+  const third = tracker.openOrTouch(openInput({ openedAtTurn: 3 }))
+  assert.equal(third.fired, true)
 })
 
 test("invalid cids are dropped and cid cap keeps first 32 valid cids", () => {
   const drops: Array<{ cid: string; reason: string }> = []
   const tracker = new EpisodeTracker({ onDrop: (cid, reason) => drops.push({ cid, reason }) })
+  tracker.openOrTouch(openInput({ sessionId: "s6" }))
   const cids = Array.from({ length: 34 }, (_, index) => index.toString(16).padStart(64, "0"))
-  tracker.openEpisode({
-    orgId: "org",
-    sessionId: "s6",
-    needSignature: "need-cap",
-    injectedCids: ["bad-cid", cidC.toUpperCase(), ...cids],
-    triggers: [],
-    failing: { build: true, test: false },
-    openedAtTurn: 1,
-  })
+  tracker.recordServe("s6", keyA, ["bad-cid", cidC.toUpperCase(), ...cids])
 
   const outcomes = tracker.closeSession("s6")
   assert.equal(outcomes.length, 32)
@@ -252,7 +420,7 @@ test("invalid cids are dropped and cid cap keeps first 32 valid cids", () => {
 })
 
 test("deriveDeterministicNonceHex is deterministic 16-hex and changes when resolution flips", () => {
-  const episodeRef = computeEpisodeRef("org", "s7", "need")
+  const episodeRef = computeEpisodeRef("org", "s7", "failure-key")
   const workedNonce = deriveDeterministicNonceHex("org", cidA, episodeRef, "worked")
   const workedNonceAgain = deriveDeterministicNonceHex("org", cidA, episodeRef, "worked")
   const failedNonce = deriveDeterministicNonceHex("org", cidA, episodeRef, "unobserved")

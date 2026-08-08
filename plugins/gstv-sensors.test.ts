@@ -234,26 +234,46 @@ const setupPluginHarness = async (opts: PluginHarnessOptions = {}): Promise<Plug
   }
 }
 
-const triggerRecall = async (
+const failOutput = () => ({
+  title: "",
+  output: "error TS1234: broken",
+  metadata: { exit: 1, exit_code: 1 },
+})
+
+const emitFileEdit = async (
+  hooks: Record<string, (input: any, output: any) => Promise<void>>,
+  sessionID: string,
+): Promise<void> => {
+  await hooks["event"]({ event: { type: "file.edited", properties: { sessionID, file: "src/x.ts" } } }, undefined)
+}
+
+// C3 trigger rework: the sole recall trigger is a REPEAT failure under a stable
+// failureKey (D-RECALL-TRIGGER-REPEAT). Drive the repeat-failure pattern: first
+// red opens the episode, a file.edited between reds arms the C3b flake guard,
+// and the second red arms the recall. Polls until the recall fetch lands so
+// binding/wevibe warm-up is absorbed, like the old chat.message loop.
+const driveRepeatFailure = async (
   hooks: Record<string, (input: any, output: any) => Promise<void>>,
   calls: FetchCall[],
   sessionID: string,
 ): Promise<void> => {
   const recallBefore = calls.filter(call => call.url.endsWith("/v1/recall")).length
+  await hooks["tool.execute.after"](
+    { sessionID, callID: `${sessionID}-fail-1`, tool: "bash", args: { command: "npm run build" } },
+    failOutput(),
+  )
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    await hooks["chat.message"](
-      { sessionID },
-      {
-        parts: [{ type: "text", text: `recall prompt ${attempt}` }],
-      },
+    await emitFileEdit(hooks, sessionID)
+    await hooks["tool.execute.after"](
+      { sessionID, callID: `${sessionID}-fail-${attempt + 2}`, tool: "bash", args: { command: "npm run build" } },
+      failOutput(),
     )
-    const recallAfter = calls.filter(call => call.url.endsWith("/v1/recall")).length
-    if (recallAfter > recallBefore) {
+    if (calls.filter(call => call.url.endsWith("/v1/recall")).length > recallBefore) {
       return
     }
     await sleep(25)
   }
-  throw new Error("Timed out waiting for recall request")
+  throw new Error("Timed out waiting for repeat-failure recall")
 }
 
 test("gstv hooks: closed goal records nothing", async () => {
@@ -510,7 +530,7 @@ test("plugin sensors: zero-delta output across sensors on/off with spool only in
 
   const sessionID = "sid-zero-delta"
   await on.hooks.event({ event: { type: "session.created", properties: { sessionID, info: { id: sessionID, directory: on.worktree } } } }, {})
-  await triggerRecall(on.hooks, on.calls, sessionID)
+  await driveRepeatFailure(on.hooks, on.calls, sessionID)
 
   const onTransform = { system: ["seed-system"] as string[] }
   await on.hooks["experimental.chat.system.transform"]({ sessionID, model: { id: "m" } }, onTransform)
@@ -521,7 +541,7 @@ test("plugin sensors: zero-delta output across sensors on/off with spool only in
 
   off = await setupPluginHarness({ sensorsEnv: "0", wevibeRoot: rootOff })
   await off.hooks.event({ event: { type: "session.created", properties: { sessionID, info: { id: sessionID, directory: off.worktree } } } }, {})
-  await triggerRecall(off.hooks, off.calls, sessionID)
+  await driveRepeatFailure(off.hooks, off.calls, sessionID)
   const offTransform = { system: ["seed-system"] as string[] }
   await off.hooks["experimental.chat.system.transform"]({ sessionID, model: { id: "m" } }, offTransform)
   const offCompacting = { context: ["c0"] as string[] }
@@ -571,7 +591,7 @@ test("plugin sensors: inject logs carry cadence/top_k/block_tokens and compactin
   t.after(() => harness.cleanup())
 
   const sessionID = "sid-inject-log"
-  await triggerRecall(harness.hooks, harness.calls, sessionID)
+  await driveRepeatFailure(harness.hooks, harness.calls, sessionID)
   const transformOutput = { system: ["seed"] as string[] }
   await harness.hooks["experimental.chat.system.transform"]({ sessionID, model: { id: "m" } }, transformOutput)
   await harness.hooks["experimental.session.compacting"]({ sessionID }, { context: [] as string[] })
@@ -599,7 +619,7 @@ test("plugin sensors: serve receipt failures log status and reason with cid fing
   })
 
   const session400 = "sid-serve-400"
-  await triggerRecall(statusHarness.hooks, statusHarness.calls, session400)
+  await driveRepeatFailure(statusHarness.hooks, statusHarness.calls, session400)
   await statusHarness.hooks["experimental.chat.system.transform"]({ sessionID: session400, model: { id: "m" } }, { system: ["seed"] as string[] })
   await sleep(35)
   const failedStatus = statusHarness.logs.find(line => line.includes("[serve] receipt failed"))
@@ -609,7 +629,7 @@ test("plugin sensors: serve receipt failures log status and reason with cid fing
 
   rejectHarness = await setupPluginHarness({ sensorsEnv: undefined, servesMode: "reject", memories: [{ cid: "cid-serve-reject", text: "Memory reject" }] })
   const sessionReject = "sid-serve-reject"
-  await triggerRecall(rejectHarness.hooks, rejectHarness.calls, sessionReject)
+  await driveRepeatFailure(rejectHarness.hooks, rejectHarness.calls, sessionReject)
   await rejectHarness.hooks["experimental.chat.system.transform"]({ sessionID: sessionReject, model: { id: "m" } }, { system: ["seed"] as string[] })
   await sleep(35)
   const failedReason = rejectHarness.logs.find(line => line.includes("[serve] receipt failed") && line.includes("reason="))

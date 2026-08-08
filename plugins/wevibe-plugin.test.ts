@@ -6,6 +6,8 @@ import test from 'node:test';
 
 // @ts-expect-error tsx test runner resolves .ts extension imports.
 import { WeVibeMemoryPlugin, buildMemoryBlock, formatMemoryLine } from './wevibe-plugin.ts';
+// @ts-expect-error tsx test runner resolves .ts extension imports.
+import { registerPredicateAdapter, type PredicateAdapter, type PredicateRunContext } from './predicate-adapter.ts';
 
 type FetchCall = {
   url: string
@@ -230,26 +232,48 @@ const setupHarness = async (
   };
 };
 
-const triggerRecall = async (
+const failOutput = (): { title: string; output: string; metadata: Record<string, unknown> } => ({
+  title: '',
+  output: 'error TS1234: broken',
+  metadata: { exit: 1, exit_code: 1 },
+});
+
+const redCall = (sessionID: string, callID: string): Record<string, unknown> => ({
+  sessionID,
+  callID,
+  tool: 'bash',
+  args: { command: 'npm run build' },
+});
+
+const emitFileEdit = async (
+  hooks: Record<string, (input: unknown, output: unknown) => Promise<void>>,
+  sessionID: string,
+): Promise<void> => {
+  await hooks['event']({ event: { type: 'file.edited', properties: { sessionID, file: 'src/x.ts' } } }, undefined);
+};
+
+// C3 trigger rework: the sole recall trigger is a REPEAT failure under a stable
+// failureKey (D-RECALL-TRIGGER-REPEAT). Drive the repeat-failure pattern: first
+// red opens the episode (no arm), a file.edited between reds arms the C3b flake
+// guard, and the second red arms the recall. Polls until the recall fetch lands
+// so binding/wevibe warm-up is absorbed, exactly like the old chat.message loop.
+const driveRepeatFailure = async (
   hooks: Record<string, (input: unknown, output: unknown) => Promise<void>>,
   calls: FetchCall[],
   sessionID: string,
 ): Promise<void> => {
   const recallBefore = calls.filter(call => call.url.endsWith('/v1/recall')).length;
+  // call #1: first red — opens the episode, never arms.
+  await hooks['tool.execute.after'](redCall(sessionID, `${sessionID}-fail-1`), failOutput());
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    await hooks['chat.message'](
-      { sessionID },
-      {
-        parts: [{ type: 'text', text: `recall prompt ${attempt}` }],
-      },
-    );
-    const recallAfter = calls.filter(call => call.url.endsWith('/v1/recall')).length;
-    if (recallAfter > recallBefore) {
+    await emitFileEdit(hooks, sessionID);
+    await hooks['tool.execute.after'](redCall(sessionID, `${sessionID}-fail-${attempt + 2}`), failOutput());
+    if (calls.filter(call => call.url.endsWith('/v1/recall')).length > recallBefore) {
       return;
     }
     await sleep(25);
   }
-  throw new Error('Timed out waiting for recall request');
+  throw new Error('Timed out waiting for repeat-failure recall');
 };
 
 const recallCalls = (calls: FetchCall[]): FetchCall[] => calls.filter(call => call.url.endsWith('/v1/recall'));
@@ -312,7 +336,7 @@ test('injects once per session, preserves stable position, avoids re-push, resto
   const { hooks, calls } = harness;
   const sessionID = 'session-inject-once';
 
-  await triggerRecall(hooks, calls, sessionID);
+  await driveRepeatFailure(hooks, calls, sessionID);
 
   const turnOneOutput = { system: ['base system instruction'] };
   await hooks['experimental.chat.system.transform']({ sessionID }, turnOneOutput);
@@ -353,7 +377,7 @@ test('injects at index 0 when output.system starts empty', { concurrency: false 
   const { hooks, calls } = harness;
   const sessionID = 'session-empty-system';
 
-  await triggerRecall(hooks, calls, sessionID);
+  await driveRepeatFailure(hooks, calls, sessionID);
 
   const output = { system: [] as string[] };
   await hooks['experimental.chat.system.transform']({ sessionID }, output);
@@ -374,7 +398,7 @@ test('prod recall mode drains accept decisions into approved and injects them vi
   const { hooks, calls, appLogs, worktree } = harness;
   const sessionID = 'session-prod-accept-drain';
 
-  await triggerRecall(hooks, calls, sessionID);
+  await driveRepeatFailure(hooks, calls, sessionID);
 
   const preDecisionOutput = { system: ['base system instruction'] };
   await hooks['experimental.chat.system.transform']({ sessionID }, preDecisionOutput);
@@ -417,7 +441,7 @@ test('budget cap skips oversized memory, continues to inject fitting later memor
   const { hooks, calls } = harness;
   const sessionID = 'session-budget';
 
-  await triggerRecall(hooks, calls, sessionID);
+  await driveRepeatFailure(hooks, calls, sessionID);
 
   const firstTurn = { system: ['seed system'] };
   await hooks['experimental.chat.system.transform']({ sessionID }, firstTurn);
@@ -449,33 +473,19 @@ test('fires need-gated recall on failing tool.execute.after signals', { concurre
   const { hooks, calls } = harness;
   const sessionID = 'session-tool-failure-fire';
 
-  await triggerRecall(hooks, calls, sessionID);
+  await driveRepeatFailure(hooks, calls, sessionID);
   await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
-  await hooks['tool.execute.after'](
-    {
-      tool: 'bash',
-      sessionID,
-      callID: 'call-build-1',
-      args: { command: 'npm run build' },
-    },
-    {
-      title: '',
-      output: 'error TS2345: boom',
-      metadata: { exit: 1 },
-    },
-  );
-
-  await waitForRecallCount(calls, 2);
+  await waitForRecallCount(calls, 1);
 
   const recalls = recallCalls(calls);
-  assert.equal(recalls.length, 2);
+  assert.equal(recalls.length, 1);
 
-  const secondBody = JSON.parse(recalls[1].bodyText ?? '{}') as Record<string, unknown>;
-  const secondQuery = typeof secondBody.query === 'string' ? secondBody.query : '';
-  assert.match(secondQuery, /(build failing|tool failure)/);
-  assert.ok(secondQuery.includes('npm run build'));
-  assert.equal(typeof secondBody.org_id, 'string');
-  assert.equal(typeof secondBody.session_id, 'string');
+  const body = JSON.parse(recalls[0].bodyText ?? '{}') as Record<string, unknown>;
+  const query = typeof body.query === 'string' ? body.query : '';
+  assert.match(query, /(build failing|tool failure)/);
+  assert.ok(query.includes('npm run build'));
+  assert.equal(typeof body.org_id, 'string');
+  assert.equal(typeof body.session_id, 'string');
 });
 
 test('stays silent on clean tool.execute.after results', { concurrency: false }, async (t) => {
@@ -485,7 +495,7 @@ test('stays silent on clean tool.execute.after results', { concurrency: false },
   const { hooks, calls } = harness;
   const sessionID = 'session-tool-clean';
 
-  await triggerRecall(hooks, calls, sessionID);
+  await driveRepeatFailure(hooks, calls, sessionID);
   await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
   await hooks['tool.execute.after'](
     {
@@ -517,9 +527,13 @@ test('dedups identical failing signatures for tool.execute.after recall', { conc
     metadata: { exit: 1 },
   };
 
-  await triggerRecall(hooks, calls, sessionID);
+  await driveRepeatFailure(hooks, calls, sessionID);
   await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
+  await waitForRecallCount(calls, 1);
 
+  // A third identical failing red (even with another file edit) must NOT fire
+  // again: after the armed call the key is markFired (episode.fired=true).
+  await emitFileEdit(hooks, sessionID);
   await hooks['tool.execute.after'](
     {
       tool: 'bash',
@@ -529,8 +543,7 @@ test('dedups identical failing signatures for tool.execute.after recall', { conc
     },
     failingOutput,
   );
-  await waitForRecallCount(calls, 2);
-
+  await emitFileEdit(hooks, sessionID);
   await hooks['tool.execute.after'](
     {
       tool: 'bash',
@@ -542,7 +555,7 @@ test('dedups identical failing signatures for tool.execute.after recall', { conc
   );
   await sleep(150);
 
-  assert.equal(recallCalls(calls).length, 2);
+  assert.equal(recallCalls(calls).length, 1);
 });
 
 test('does not fire tool failure recall while recall request is in flight', { concurrency: false }, async (t) => {
@@ -567,25 +580,59 @@ test('does not fire tool failure recall while recall request is in flight', { co
   );
   t.after(() => harness.cleanup());
 
-  const { hooks, calls } = harness;
+  const { hooks, calls, appLogs } = harness;
   const sessionID = 'session-tool-inflight';
 
   try {
-    await triggerRecall(hooks, calls, sessionID);
-    assert.equal(recallCalls(calls).length, 1);
+    // Wait for the binding + wevibe readiness so the arming red below actually fires.
+    await waitForAppLog(appLogs, /\[binding\] session bind: active=true/);
+    await waitForAppLog(appLogs, /\[recall\] init wevibeAvailable=true/);
 
+    // Arm episode A (build fail): first red opens it, file edit between, second
+    // red arms the recall which stays in flight (deferred responder).
     await hooks['tool.execute.after'](
       {
         tool: 'bash',
         sessionID,
-        callID: 'call-inflight-1',
+        callID: 'inflight-a-1',
         args: { command: 'npm run build' },
       },
+      { title: '', output: 'error TS1234: broken', metadata: { exit: 1 } },
+    );
+    await emitFileEdit(hooks, sessionID);
+    await hooks['tool.execute.after'](
       {
-        title: '',
-        output: 'error TS2345: boom',
-        metadata: { exit: 1 },
+        tool: 'bash',
+        sessionID,
+        callID: 'inflight-a-2',
+        args: { command: 'npm run build' },
       },
+      { title: '', output: 'error TS1234: broken', metadata: { exit: 1 } },
+    );
+    await waitForRecallCount(calls, 1);
+    assert.equal(recallCalls(calls).length, 1);
+
+    // A DIFFERENT episode (test fail, distinct command fp) would arm on its
+    // repeat red, but the recall is still in flight, so the !recallInFlight
+    // guard suppresses it. Assert no second recall fires.
+    await hooks['tool.execute.after'](
+      {
+        tool: 'bash',
+        sessionID,
+        callID: 'inflight-b-1',
+        args: { command: 'npm run test' },
+      },
+      { title: '', output: 'error TS9999: broken', metadata: { exit: 1 } },
+    );
+    await emitFileEdit(hooks, sessionID);
+    await hooks['tool.execute.after'](
+      {
+        tool: 'bash',
+        sessionID,
+        callID: 'inflight-b-2',
+        args: { command: 'npm run test' },
+      },
+      { title: '', output: 'error TS9999: broken', metadata: { exit: 1 } },
     );
 
     await sleep(150);
@@ -611,28 +658,15 @@ test('emits funnel recall_fired and recall_returned line shapes with matching tr
   const { hooks, calls, appLogs, logFilePath } = harness;
   const sessionID = 'session-tool-funnel';
 
-  await triggerRecall(hooks, calls, sessionID);
+  await driveRepeatFailure(hooks, calls, sessionID);
   await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
-  await hooks['tool.execute.after'](
-    {
-      tool: 'bash',
-      sessionID,
-      callID: 'call-funnel-1',
-      args: { command: 'npm run build' },
-    },
-    {
-      title: '',
-      output: 'error TS2345: boom',
-      metadata: { exit: 1 },
-    },
-  );
-  await waitForRecallCount(calls, 2);
+  await waitForRecallCount(calls, 1);
+  await waitForAppLog(appLogs, /recall_returned /);
   await sleep(50);
 
   const messages = appLogMessages(appLogs);
 
-  assert.ok(messages.some(message => /recall_fired trigger=user_message sid=\S+/.test(message)));
-  assert.ok(messages.some(message => /recall_fired trigger=tool_failure sid=\S+/.test(message)));
+  assert.ok(messages.some(message => /recall_fired trigger=repeat_failure sid=\S+/.test(message)));
   assert.ok(messages.some(message => /recall_returned status=\S+ count=\d+ reason_code=\S+ dur_ms=\d+ error=\S+/.test(message)));
 
   assert.ok(logFilePath);
@@ -641,17 +675,16 @@ test('emits funnel recall_fired and recall_returned line shapes with matching tr
   const firedLines = recallLines.filter(line => line.includes('recall_fired'));
   const returnedLines = recallLines.filter(line => line.includes('recall_returned'));
 
-  assert.ok(firedLines.some(line => /recall_fired trigger=user_message sid=\S+/.test(line)));
-  assert.ok(firedLines.some(line => /recall_fired trigger=tool_failure sid=\S+/.test(line)));
+  assert.ok(firedLines.some(line => /recall_fired trigger=repeat_failure sid=\S+/.test(line)));
   assert.ok(firedLines.every(line => /trace=[0-9a-f]{8}/.test(line)));
   assert.ok(returnedLines.length >= firedLines.length);
   assert.ok(returnedLines.every(line => /recall_returned status=\S+ count=\d+ reason_code=\S+ dur_ms=\d+ error=\S+/.test(line)));
 
-  const toolFailureLine = firedLines.find(line => /recall_fired trigger=tool_failure sid=\S+/.test(line));
-  assert.ok(toolFailureLine);
-  const toolFailureTrace = (toolFailureLine?.match(/trace=([0-9a-f]{8})/) ?? [])[1];
-  assert.equal(typeof toolFailureTrace, 'string');
-  assert.ok(returnedLines.some(line => line.includes(`trace=${toolFailureTrace}`)));
+  const repeatFailureLine = firedLines.find(line => /recall_fired trigger=repeat_failure sid=\S+/.test(line));
+  assert.ok(repeatFailureLine);
+  const repeatFailureTrace = (repeatFailureLine?.match(/trace=([0-9a-f]{8})/) ?? [])[1];
+  assert.equal(typeof repeatFailureTrace, 'string');
+  assert.ok(returnedLines.some(line => line.includes(`trace=${repeatFailureTrace}`)));
 });
 
 test('posts a decision-note on deny with org, memory hash, and reason', { concurrency: false }, async (t) => {
@@ -661,7 +694,7 @@ test('posts a decision-note on deny with org, memory hash, and reason', { concur
   const { hooks, calls } = harness;
   const sessionID = 'session-decision-note-deny-reason';
 
-  await triggerRecall(hooks, calls, sessionID);
+  await driveRepeatFailure(hooks, calls, sessionID);
   writeDecisions(harness, [{ memoryID: 'cid-deny-1', action: 'deny', reason: 'not relevant', timestamp: Date.now() }]);
 
   await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
@@ -695,7 +728,7 @@ test('omits reason on the decision-note when the deny carries none', { concurren
   const { hooks, calls } = harness;
   const sessionID = 'session-decision-note-deny-no-reason';
 
-  await triggerRecall(hooks, calls, sessionID);
+  await driveRepeatFailure(hooks, calls, sessionID);
   writeDecisions(harness, [{ memoryID: 'cid-deny-2', action: 'deny', timestamp: Date.now() }]);
 
   await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
@@ -723,7 +756,7 @@ test('logs but does not fail the deny when the decision-note endpoint returns no
   const { hooks, calls } = harness;
   const sessionID = 'session-decision-note-deny-500';
 
-  await triggerRecall(hooks, calls, sessionID);
+  await driveRepeatFailure(hooks, calls, sessionID);
   writeDecisions(harness, [{ memoryID: 'cid-deny-3', action: 'deny', reason: 'bad status', timestamp: Date.now() }]);
 
   await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
@@ -749,7 +782,7 @@ test('logs but does not fail the deny when the decision-note fetch throws', { co
   const { hooks, calls } = harness;
   const sessionID = 'session-decision-note-deny-fetch-throw';
 
-  await triggerRecall(hooks, calls, sessionID);
+  await driveRepeatFailure(hooks, calls, sessionID);
   writeDecisions(harness, [{ memoryID: 'cid-deny-4', action: 'deny', reason: 'network fail', timestamp: Date.now() }]);
 
   await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
@@ -758,4 +791,118 @@ test('logs but does not fail the deny when the decision-note fetch throws', { co
   assert.deepEqual(readDecisions(harness), []);
   const status = readStatus(harness) as { denied?: string[] };
   assert.ok(status.denied?.includes('cid-deny-4'));
+});
+
+test('C3b flake guard: a repeat red without a file edit does not arm, and a later edit arms', { concurrency: false }, async (t) => {
+  const harness = await setupHarness([{ cid: 'cid-flake-guard', text: 'flake guard memory' }], { recall_max_injected: 10, inject_char_budget: 8000 });
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls, appLogs } = harness;
+  const sessionID = 'session-flake-guard-arm';
+
+  await waitForAppLog(appLogs, /\[binding\] session bind: active=true/);
+  await waitForAppLog(appLogs, /\[recall\] init wevibeAvailable=true/);
+
+  // call #1: first red opens the episode.
+  await hooks['tool.execute.after'](redCall(sessionID, 'flake-1'), failOutput());
+  // call #2: repeat red with NO file edit between → TOUCHED but never arms (C3b).
+  await hooks['tool.execute.after'](redCall(sessionID, 'flake-2'), failOutput());
+  await sleep(150);
+  assert.equal(recallCalls(calls).length, 0);
+
+  // A file edit on a LATER repeat then arms — the unedited repeat did not burn
+  // the interrupt (the episode is still the same open, non-fired episode).
+  await emitFileEdit(hooks, sessionID);
+  await hooks['tool.execute.after'](redCall(sessionID, 'flake-3'), failOutput());
+  await waitForRecallCount(calls, 1);
+  assert.equal(recallCalls(calls).length, 1);
+});
+
+test('C3b flake guard: no edit then green records no false worked', { concurrency: false }, async (t) => {
+  const harness = await setupHarness([{ cid: 'cid-flake-green', text: 'flake green memory' }], { recall_max_injected: 10, inject_char_budget: 8000 });
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls, appLogs } = harness;
+  const sessionID = 'session-flake-guard-green';
+
+  await waitForAppLog(appLogs, /\[binding\] session bind: active=true/);
+  await waitForAppLog(appLogs, /\[recall\] init wevibeAvailable=true/);
+
+  // call #1: first red opens the episode.
+  await hooks['tool.execute.after'](redCall(sessionID, 'fg-1'), failOutput());
+  // call #2: repeat red with no edit → touches but does not arm.
+  await hooks['tool.execute.after'](redCall(sessionID, 'fg-2'), failOutput());
+  await sleep(150);
+  assert.equal(recallCalls(calls).length, 0);
+
+  // A green closes the episode, but it was never served (never armed/fired), so
+  // no outcome is harvested — the unedited repeat produced no false "worked".
+  await hooks['tool.execute.after'](
+    { sessionID, callID: 'fg-green', tool: 'bash', args: { command: 'npm run build' } },
+    { title: '', output: 'ok', metadata: { exit: 0 } },
+  );
+  await sleep(150);
+  assert.equal(recallCalls(calls).length, 0);
+  assert.ok(!appLogMessages(appLogs).some(message => message.includes('[outcome] harvested')));
+});
+
+test('C3a cascade fan-out: one arm per red wave, first sorted id armed, non-first markFired, test-scoped green close', { concurrency: false }, async (t) => {
+  const CASCADE_COMMAND = 'npm run cascade';
+  const cascadeAdapter: PredicateAdapter = {
+    predicateId: 'cascade:unit',
+    matches: (ctx: PredicateRunContext): boolean => ctx.command === CASCADE_COMMAND,
+    extractFailingTestIds: (): string[] => ['pkg/b.test.ts', 'pkg/a.test.ts'],
+    extractPassingTestIds: (ctx: PredicateRunContext): string[] =>
+      (ctx.metadata as { passing?: boolean } | undefined)?.passing ? ['pkg/a.test.ts'] : [],
+  };
+  // Module-level residue is accepted (no unregister exists); the marker command
+  // is distinctive so it never collides with other tests' tripwire path.
+  registerPredicateAdapter(cascadeAdapter);
+
+  const harness = await setupHarness([{ cid: 'c0'.repeat(32), text: 'cascade memory' }], { recall_max_injected: 10, inject_char_budget: 8000 });
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls, appLogs } = harness;
+  const sessionID = 'session-cascade';
+
+  await waitForAppLog(appLogs, /\[binding\] session bind: active=true/);
+  await waitForAppLog(appLogs, /\[recall\] init wevibeAvailable=true/);
+
+  const cascadeRed = (callID: string): Record<string, unknown> => ({
+    sessionID,
+    callID,
+    tool: 'bash',
+    args: { command: CASCADE_COMMAND },
+  });
+  const cascadeFail = (): Record<string, unknown> => ({ title: '', output: 'failing cascade tests', metadata: { exit: 1 } });
+
+  // Wave #1: first red under the predicate — opens an episode PER failing test
+  // (both a.test.ts and b.test.ts), neither fires. b is already markFired (non-first).
+  await hooks['tool.execute.after'](cascadeRed('cascade-1'), cascadeFail());
+  await sleep(50);
+  assert.equal(recallCalls(calls).length, 0);
+
+  // Wave #2 (after a file edit): the FIRST sorted id (pkg/a.test.ts) arms once;
+  // b.test.ts stays markFired. Exactly ONE recall for the wave, not two.
+  await emitFileEdit(hooks, sessionID);
+  await hooks['tool.execute.after'](cascadeRed('cascade-2'), cascadeFail());
+  await waitForRecallCount(calls, 1);
+  assert.equal(recallCalls(calls).length, 1);
+
+  // Inject so the armed a.test.ts episode is served (pairs its outcome on close).
+  await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
+
+  // Wave #3 (with edit): a.test.ts is already fired, b.test.ts markFired — no new fire.
+  await emitFileEdit(hooks, sessionID);
+  await hooks['tool.execute.after'](cascadeRed('cascade-3'), cascadeFail());
+  await sleep(150);
+  assert.equal(recallCalls(calls).length, 1);
+
+  // Green for ONLY pkg/a.test.ts → test-scoped close of a; b.test.ts stays open.
+  await hooks['tool.execute.after'](
+    cascadeRed('cascade-green'),
+    { title: '', output: 'a passed', metadata: { exit: 0, passing: true } },
+  );
+  await waitForAppLog(appLogs, /\[outcome\] harvested n=1 worked=true/);
+  assert.ok(appLogMessages(appLogs).some(message => message.includes('[outcome] harvested n=1 worked=true')));
 });
