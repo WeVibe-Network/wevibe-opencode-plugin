@@ -8,6 +8,14 @@ import test from 'node:test';
 import { WeVibeMemoryPlugin, buildMemoryBlock, formatMemoryLine } from './wevibe-plugin.ts';
 // @ts-expect-error tsx test runner resolves .ts extension imports.
 import { registerPredicateAdapter, type PredicateAdapter, type PredicateRunContext } from './predicate-adapter.ts';
+// @ts-expect-error tsx test runner resolves .ts extension imports.
+import { computeFailureKey } from './failure-key.ts';
+// @ts-expect-error tsx test runner resolves .ts extension imports.
+import { computeEpisodeRef } from './outcome-episode.ts';
+// @ts-expect-error tsx test runner resolves .ts extension imports.
+import { fp8 } from './gstv-spool.ts';
+// @ts-expect-error tsx test runner resolves .ts extension imports.
+import { clearPredicateCache } from './predicate-binding.ts';
 
 type FetchCall = {
   url: string
@@ -905,4 +913,93 @@ test('C3a cascade fan-out: one arm per red wave, first sorted id armed, non-firs
   );
   await waitForAppLog(appLogs, /\[outcome\] harvested n=1 worked=true/);
   assert.ok(appLogMessages(appLogs).some(message => message.includes('[outcome] harvested n=1 worked=true')));
+});
+
+test('bench-fixture adapter: failing-test-scoped failureKey + C3b flake guard', { concurrency: false }, async (t) => {
+  // Module-global predicate cache is keyed by repoRoot (a fresh temp worktree
+  // per harness), but clear it anyway so a stale declaration never leaks in.
+  clearPredicateCache();
+
+  const harness = await setupHarness([{ cid: 'c1'.repeat(32), text: 'bench memory' }], { recall_max_injected: 10, inject_char_budget: 8000 });
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls, appLogs, worktree } = harness;
+  const sessionID = 'session-bench';
+  const BENCH_CMD = 'npm run bench';
+  const FAILING_TEST = 'suite:file::TestA';
+  const PASSING_TEST = 'suite:file::TestB';
+
+  // Declare the bench-fixture predicate in the spawn-root .wevibe dir BEFORE
+  // the bind resolves so resolvePredicateForRepo binds it once at bind time.
+  writeFileSync(
+    join(worktree, '.wevibe', 'predicate.json'),
+    JSON.stringify({ reporter: 'bench-fixture', command: BENCH_CMD }),
+    'utf8',
+  );
+
+  await waitForAppLog(appLogs, /\[binding\] session bind: active=true/);
+  await waitForAppLog(appLogs, /\[recall\] init wevibeAvailable=true/);
+
+  const benchRed = (callID: string): Record<string, unknown> => ({
+    sessionID,
+    callID,
+    tool: 'bash',
+    args: { command: BENCH_CMD },
+  });
+  const benchRedOutput = (): Record<string, unknown> => ({
+    title: '',
+    output: `WEVIBE-BENCH-REPORT v1\n{"test":"${FAILING_TEST}","status":"fail"}\n{"test":"${PASSING_TEST}","status":"pass"}\n`,
+    metadata: { exit: 1 },
+  });
+
+  // Wave #1: first red under the bench predicate opens the per-test episode,
+  // never arms (C3b).
+  await hooks['tool.execute.after'](benchRed('bench-1'), benchRedOutput());
+  await sleep(50);
+  assert.equal(recallCalls(calls).length, 0);
+
+  // Wave #2 (NO file edit): C3b flake guard suppresses the arm.
+  await hooks['tool.execute.after'](benchRed('bench-2'), benchRedOutput());
+  await sleep(50);
+  assert.equal(recallCalls(calls).length, 0);
+
+  // Wave #3 (after a file edit): the repeat red arms exactly once.
+  await emitFileEdit(hooks, sessionID);
+  await hooks['tool.execute.after'](benchRed('bench-3'), benchRedOutput());
+  await waitForRecallCount(calls, 1);
+  assert.equal(recallCalls(calls).length, 1);
+
+  // Inject so the armed FAILING_TEST episode is served (pairs its outcome on close).
+  await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
+
+  // Green carrying ONLY the FAILING_TEST as passing → test-scoped close.
+  await hooks['tool.execute.after'](
+    benchRed('bench-green'),
+    { title: '', output: `WEVIBE-BENCH-REPORT v1\n{"test":"${FAILING_TEST}","status":"pass"}\n`, metadata: { exit: 0 } },
+  );
+
+  // Read the outcome spool and assert the failureKey was failing-test-scoped
+  // (episode_ref derived from bench-fixture:v1 + failing test id), NOT the
+  // tripwire (cmd:<fp8> + null test) identity.
+  const spoolPath = join(worktree, '.wevibe', 'state', 'outcome-spool', 'outcome-spool-v1.jsonl');
+  let episodeRefs: string[] = [];
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if (existsSync(spoolPath)) {
+      const text = readFileSync(spoolPath, 'utf8').trim();
+      episodeRefs = text.length === 0 ? [] : text.split('\n').map(line => (JSON.parse(line) as { episode_ref: string }).episode_ref);
+      if (episodeRefs.length >= 1) break;
+    }
+    await sleep(25);
+  }
+  assert.ok(episodeRefs.length >= 1, 'expected at least one harvested outcome');
+
+  const commandFp8 = fp8(BENCH_CMD);
+  const repoBinding = 'a'.repeat(64);
+  const benchKey = computeFailureKey({ repoBinding, predicateId: 'bench-fixture:v1', failingTest: FAILING_TEST, commandFp8 });
+  const expectedRef = computeEpisodeRef('org-test', sessionID, benchKey);
+  const tripwireKey = computeFailureKey({ repoBinding, predicateId: `cmd:${commandFp8}`, failingTest: null, commandFp8 });
+  const tripwireRef = computeEpisodeRef('org-test', sessionID, tripwireKey);
+
+  assert.ok(episodeRefs.includes(expectedRef), 'episode_ref must match the failing-test-scoped key');
+  assert.ok(!episodeRefs.includes(tripwireRef), 'must NOT fall back to the tripwire identity');
 });

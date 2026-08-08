@@ -11,8 +11,17 @@ import { createSpool, excerpt, fp8, type Spool } from "./gstv-spool"
 import { GSTV_BOUNDARY_TIMEOUT_MS, onSessionCreated, onSessionIdle, type GstvHookDeps } from "./gstv-hooks"
 import { EpisodeTracker, type HarvestedOutcome } from "./outcome-episode"
 import { computeFailureKey } from "./failure-key"
-import { resolvePredicateAdapter } from "./predicate-adapter"
+import { resolvePredicateAdapter, registerPredicateAdapter } from "./predicate-adapter"
+import { benchFixtureAdapter } from "./bench-fixture-adapter"
+import { resolvePredicateForRepo, clearPredicateCache, type ResolvedPredicate } from "./predicate-binding"
 import { createOutcomeSpool } from "./outcome-spool"
+
+// Register the bench-fixture predicate adapter into the global registry at
+// module load so it is discoverable via resolvePredicateAdapter(ctx) for any
+// red/green tool output carrying the WEVIBE-BENCH-REPORT v1 header. Its strict
+// `matches` (header on its own line + exitCode !== null) never collides with the
+// cascadeAdapter test's command marker or the tripwire path.
+registerPredicateAdapter(benchFixtureAdapter)
 
 interface CachedMemory {
   cid: string
@@ -658,14 +667,22 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     // HARD-GATE (Walter 2026-07-08): binding is decided SOLELY by the OpenCode
     // session SPAWN-ROOT worktree marker — `worktree` is that root; no subdir/parent walk.
     void detectBinding(worktree)
-      .then((s) => {
+      .then(async (s) => {
         bindingState = s
+        if (s.active) {
+          boundPredicate = await resolvePredicateForRepo(worktree)
+        } else {
+          boundPredicate = null
+          clearPredicateCache()
+        }
         logPlugin(
           "info",
           `[binding] session bind: active=${s.active} org=${s.orgId ?? "-"} fp=${fp(s.fingerprint ?? "")} src=${s.source ?? "-"} root=${worktree}`,
         )
       })
       .catch((e) => {
+        boundPredicate = null
+        clearPredicateCache()
         logPlugin("error", `[binding] detect failed: ${e instanceof Error ? e.message : String(e)}`)
       })
   }
@@ -960,6 +977,9 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   const cachedMemories: CachedMemory[] = []
   let wevibeAvailable = false
   let bindingState: BindingState = { active: false }
+  // Per-repo predicate resolved ONCE at bind time and reused (not re-derived per
+  // failure). null = unconfigured / not yet resolved.
+  let boundPredicate: ResolvedPredicate | null = null
   let memoryCacheKey = ""
   let memoryCacheTimestamp = 0
   const MEMORY_CACHE_TTL_MS = 5 * 60 * 1000  // 5 minutes
@@ -2081,7 +2101,9 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           metadata: (output?.metadata ?? {}) as Record<string, unknown>,
           exitCode,
         }
-        const adapter = resolvePredicateAdapter(ctx)
+        const adapter = (boundPredicate && boundPredicate.adapter.matches(ctx))
+          ? boundPredicate.adapter
+          : resolvePredicateAdapter(ctx)
         const failingIds = adapter.extractFailingTestIds(ctx)
         const predicateId = adapter.predicateId !== "" ? adapter.predicateId : tripwirePredicateId
 
@@ -2133,7 +2155,9 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       }
 
       const greenCtx = { command, output: typeof output?.output === "string" ? output.output : "", metadata: (output?.metadata ?? {}) as Record<string, unknown>, exitCode }
-      const greenAdapter = resolvePredicateAdapter(greenCtx)
+      const greenAdapter = (boundPredicate && boundPredicate.adapter.matches(greenCtx))
+        ? boundPredicate.adapter
+        : resolvePredicateAdapter(greenCtx)
       const passingIds = greenAdapter.extractPassingTestIds(greenCtx)
       const greenPredicateId = greenAdapter.predicateId !== "" ? greenAdapter.predicateId : `cmd:${fp8(command || "")}`
       enqueueHarvestedOutcomes(needSessionId, episodeTracker.observeToolResult({
