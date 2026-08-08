@@ -157,3 +157,13 @@ export function snapshotAll(): Map<string, FunnelCounters> {
   }
   return merged
 }
+
+/**
+ * Serialize the full funnel snapshot as a flat JSON object mapping
+ * sessionId -> FunnelCounters (e.g.
+ * {"sess-1":{"episode_opened":1,...,"confirmed_on_chain":0,"gate_decision_ms":null}}).
+ * Counts/ms only — never any secrets or plaintext memory content.
+ */
+export function serializeFunnelSnapshot(): string {
+  return JSON.stringify(Object.fromEntries(snapshotAll()))
+}

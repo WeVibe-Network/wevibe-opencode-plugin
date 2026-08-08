@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
 import {
   FunnelCountersTracker,
+  createFunnelCountersTracker,
   snapshot,
   snapshotAll,
+  serializeFunnelSnapshot,
   resetFunnelCountersTrackers,
 } from './funnel-counters';
 // @ts-expect-error tsx test runner resolves .ts extension imports.
@@ -174,6 +176,7 @@ type Harness = {
   hooks: Record<string, (input: unknown, output: unknown) => Promise<void>>;
   calls: FetchCall[];
   appLogs: unknown[];
+  worktree: string;
   cleanup: () => void;
 };
 
@@ -237,6 +240,7 @@ const setupHarness = async (): Promise<Harness> => {
     hooks: plugin as unknown as Record<string, (input: unknown, output: unknown) => Promise<void>>,
     calls,
     appLogs,
+    worktree,
     cleanup,
   };
 };
@@ -329,4 +333,60 @@ test('snapshotAll empty when no tracker registered', () => {
   resetFunnelCountersTrackers();
   assert.equal(snapshotAll().size, 0);
   assert.equal(snapshot('whatever'), undefined);
+});
+
+test('serializeFunnelSnapshot returns flat sessionId->counters JSON object', () => {
+  resetFunnelCountersTrackers();
+  try {
+    const tracker = createFunnelCountersTracker();
+    const sid = 'sess-serialize';
+    tracker.episodeOpened(sid);
+    tracker.episodeOpened(sid);
+    tracker.episodeArmed(sid);
+    tracker.gateShown(sid);
+    tracker.gateDecided(sid);
+    tracker.serveSent(sid);
+    tracker.recordConfirmed(sid, 2);
+
+    const json = JSON.parse(serializeFunnelSnapshot());
+    assert.equal(typeof json, 'object');
+    assert.ok(json[sid], 'snapshot JSON exposes the recorded session');
+    assert.equal(json[sid].episode_opened, 2);
+    assert.equal(json[sid].episode_armed, 1);
+    assert.equal(json[sid].gate_shown, 1);
+    assert.equal(json[sid].serve_sent, 1);
+    assert.equal(json[sid].confirmed_on_chain, 2);
+    assert.equal(json[sid].gate_decision_ms, null);
+  } finally {
+    resetFunnelCountersTrackers();
+  }
+});
+
+test('session.idle flush writes funnel-snapshot.json with expected shape', async () => {
+  resetFunnelCountersTrackers();
+  const harness = await setupHarness();
+  try {
+    const sessionID = 'funnel-flush-session';
+    // Wait for binding + wevibe readiness so the red opens a bound episode.
+    await waitForAppLog(harness.appLogs, /\[binding\] session bind: active=true/);
+    await waitForAppLog(harness.appLogs, /\[recall\] init wevibeAvailable=true/);
+
+    // One red opens the episode (episode_opened=1).
+    await harness.hooks['tool.execute.after'](redCall(sessionID, `${sessionID}-fail-1`), failOutput());
+
+    // Drive session.idle -> terminal flush.
+    await harness.hooks['event']({ event: { type: 'session.idle', properties: { sessionID } } }, undefined);
+
+    const snapshotPath = join(harness.worktree, '.wevibe', 'state', 'funnel-snapshot.json');
+    const json = JSON.parse(readFileSync(snapshotPath, 'utf8'));
+    assert.equal(typeof json, 'object');
+    assert.ok(json[sessionID], 'snapshot file exposes the idle session');
+    // The recorded red must have opened an episode.
+    assert.equal(json[sessionID].episode_opened, 1);
+    assert.equal(typeof json[sessionID].gate_decision_ms, 'object'); // JSON null
+    assert.equal(json[sessionID].gate_decision_ms, null);
+  } finally {
+    harness.cleanup();
+    resetFunnelCountersTrackers();
+  }
 });

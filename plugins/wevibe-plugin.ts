@@ -4,7 +4,7 @@ import { homedir } from "os"
 import { fileURLToPath } from "node:url"
 import { createHash, randomUUID } from "node:crypto"
 import { SessionMetricsRecorder, assessRecallNeed, extractToolExitCode } from "./metrics"
-import { createFunnelCountersTracker, type FunnelCountersTracker } from "./funnel-counters"
+import { createFunnelCountersTracker, serializeFunnelSnapshot, type FunnelCountersTracker } from "./funnel-counters"
 import { buildRecallHarvest, type RecallHarvestSignals } from "./recall-harvest"
 import { detectBinding, type BindingState } from "./binding"
 import { resolveScopedWeVibeDir, scopedLogDir, scopedRunsDir, scopedStateDir } from "./wevibe-paths"
@@ -571,6 +571,24 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   ensureFile(queuePath, "[]\n")
   ensureFile(decisionPath, "[]\n")
   ensureFile(statusPath, "{\n  \"accepted\": [],\n  \"denied\": [],\n  \"reported\": []\n}\n")
+
+  const FUNNEL_SNAPSHOT_FILENAME = "funnel-snapshot.json"
+  // Best-effort, synchronous, never-throwing write of the funnel snapshot. A
+  // setInterval callback and the session.idle hook call this; neither may await
+  // on file IO (NON-BLOCKING INVARIANT), so we use writeFileSync in try/catch.
+  const writeFunnelSnapshot = (): void => {
+    try {
+      mkdirSync(stateDir, { recursive: true })
+      writeFileSync(join(stateDir, FUNNEL_SNAPSHOT_FILENAME), serializeFunnelSnapshot())
+    } catch (err) {
+      logPlugin("error", `funnel-snapshot: write failed: ${String(err)}`, newTrace())
+    }
+  }
+  // Periodic best-effort write so the snapshot file is live DURING a cell.
+  // unref() so the interval never keeps the plugin process alive. There is no
+  // plugin teardown hook in this factory shape; the session.idle flush is the
+  // terminal-state write for each idle session.
+  setInterval(writeFunnelSnapshot, 1000).unref()
 
   const approvedCids = new Set<string>()
   const deniedCids = new Set<string>()
@@ -1742,6 +1760,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           event: "session.idle",
           payload: {},
         })
+        // Terminal-state flush so the latest counters land on idle.
+        writeFunnelSnapshot()
         return
       }
       case "session.error": {
