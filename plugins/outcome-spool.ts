@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import { join } from "node:path";
 
 // @ts-expect-error tsx test runner resolves .ts extension imports.
-import { deriveDeterministicNonceHex, type HarvestedOutcome } from "./outcome-episode.ts";
+import { deriveDeterministicNonceHex, type HarvestedOutcome, type OutcomeResolution } from "./outcome-episode.ts";
 // @ts-expect-error tsx test runner resolves .ts extension imports.
 import { excerpt, fp8 } from "./gstv-spool.ts";
 
@@ -22,7 +22,8 @@ export interface OutcomeSpoolRecord {
   memory_hash: string;
   episode_ref: string;
   evidence_ref: string;
-  worked: boolean;
+  resolution: OutcomeResolution;
+  source: "harvested" | "user";
   nonce_hex: string;
   status: OutcomeSpoolStatus;
   attempts: number;
@@ -181,7 +182,7 @@ export function createOutcomeSpool(opts: OutcomeSpoolOptions): OutcomeSpool {
           outcome.orgId,
           outcome.memoryHash,
           outcome.episodeRef,
-          outcome.worked,
+          outcome.resolution,
         );
         const existing = latestByNonce.get(nonceHex);
         if (existing?.status === "pending" || existing?.status === "acked") {
@@ -197,7 +198,8 @@ export function createOutcomeSpool(opts: OutcomeSpoolOptions): OutcomeSpool {
           memory_hash: outcome.memoryHash,
           episode_ref: outcome.episodeRef,
           evidence_ref: outcome.evidenceRef,
-          worked: outcome.worked,
+          resolution: outcome.resolution,
+          source: "harvested",
           nonce_hex: nonceHex,
           status: "pending",
           attempts: 0,
@@ -208,7 +210,7 @@ export function createOutcomeSpool(opts: OutcomeSpoolOptions): OutcomeSpool {
         safeLog(
           opts.log,
           "info",
-          `[outcome] enqueue nonce_fp=${fp8(nonceHex)} cid_fp=${fp8(outcome.memoryHash)} worked=${outcome.worked} sid=${outcome.sessionId}`,
+          `[outcome] enqueue nonce_fp=${fp8(nonceHex)} cid_fp=${fp8(outcome.memoryHash)} resolution=${outcome.resolution} sid=${outcome.sessionId}`,
         );
       } catch (err) {
         safeLog(opts.log, "error", `[outcome] enqueue failed: ${toErrorMessage(err)}`);
@@ -268,7 +270,8 @@ export function createOutcomeSpool(opts: OutcomeSpoolOptions): OutcomeSpool {
                 org_id: record.org_id,
                 memory_hash: record.memory_hash,
                 episode_ref: record.episode_ref,
-                worked: record.worked,
+                resolution: record.resolution,
+                source: record.source,
                 evidence_ref: record.evidence_ref,
                 session_id: record.session_id,
               }),

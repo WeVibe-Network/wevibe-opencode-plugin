@@ -12,6 +12,12 @@ import { createHash } from "node:crypto"
 
 export type OutcomeResolutionKind = "build_green" | "test_green" | "command_green" | "episode_expired"
 
+// E3 tri-state (WO-ATTRIB 2026-08-07): an episode that closes with no observed
+// resolution emits "unobserved" — an observed fact about the close, never an
+// inferred failure. Silence is not a vote; the fabricated worked=false on
+// episode expiry is removed.
+export type OutcomeResolution = "worked" | "didnt_work" | "unobserved"
+
 export interface OutcomeEvidence {
   kind: OutcomeResolutionKind
   tool: string
@@ -29,7 +35,7 @@ export interface HarvestedOutcome {
   episodeRef: string
   evidenceRef: string
   memoryHash: string
-  worked: boolean
+  resolution: OutcomeResolution
   needSignature: string
 }
 
@@ -93,9 +99,9 @@ export function deriveDeterministicNonceHex(
   orgId: string,
   memoryHashHex: string,
   episodeRefHex: string,
-  worked: boolean,
+  resolution: OutcomeResolution,
 ): string {
-  const preimage = `wevibe-event-nonce-v1\n${orgId}\n${memoryHashHex}\n${episodeRefHex}\nworked=${worked ? "true" : "false"}`
+  const preimage = `wevibe-event-nonce-v1\n${orgId}\n${memoryHashHex}\n${episodeRefHex}\nresolution=${resolution}`
   return sha256Hex(preimage).slice(0, 16)
 }
 
@@ -178,7 +184,7 @@ export class EpisodeTracker {
     const kind = this.resolutionKind(episode, input)
     if (!kind) return []
 
-    return this.close(episode, true, { ...baseEvidence, kind })
+    return this.close(episode, "worked", { ...baseEvidence, kind })
   }
 
   onSessionIdle(sessionId: string): HarvestedOutcome[] {
@@ -235,10 +241,10 @@ export class EpisodeTracker {
   }
 
   private expire(episode: EpisodeState): HarvestedOutcome[] {
-    return this.close(episode, false, { ...episode.lastEvidence, kind: "episode_expired" })
+    return this.close(episode, "unobserved", { ...episode.lastEvidence, kind: "episode_expired" })
   }
 
-  private close(episode: EpisodeState, worked: boolean, evidence: OutcomeEvidence): HarvestedOutcome[] {
+  private close(episode: EpisodeState, resolution: OutcomeResolution, evidence: OutcomeEvidence): HarvestedOutcome[] {
     this.sessions.delete(episode.sessionId)
     const evidenceRef = computeEvidenceRef(evidence)
     return episode.injectedCids.map((memoryHash) => ({
@@ -247,7 +253,7 @@ export class EpisodeTracker {
       episodeRef: episode.episodeRef,
       evidenceRef,
       memoryHash,
-      worked,
+      resolution,
       needSignature: episode.needSignature,
     }))
   }

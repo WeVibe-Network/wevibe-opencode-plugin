@@ -1053,8 +1053,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     for (const outcome of outcomes) {
       outcomeSpool.enqueue(outcome)
     }
-    const worked = outcomes.some(outcome => outcome.worked)
-    logPlugin("info", `[outcome] harvested n=${outcomes.length} worked=${worked} sid=${sid} episode_fp=${fp8(outcomes[0]?.episodeRef ?? "")}`, newTrace())
+    const resolved = outcomes.some(outcome => outcome.resolution === "worked")
+    logPlugin("info", `[outcome] harvested n=${outcomes.length} worked=${resolved} sid=${sid} episode_fp=${fp8(outcomes[0]?.episodeRef ?? "")}`, newTrace())
   }
 
   async function ensureWeVibeMcpRunning(): Promise<boolean> {

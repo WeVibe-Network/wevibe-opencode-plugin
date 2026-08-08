@@ -216,7 +216,7 @@ test("outcome wiring harvests worked=true when injected memory precedes red-to-g
 
   const records = await waitForSpoolRecords(harness.worktree, 1)
   assert.equal(records.length, 1)
-  assert.equal(records[0].worked, true)
+  assert.equal(records[0].resolution, "worked")
   assert.equal(records[0].memory_hash, cid)
   assert.equal(records[0].session_id, sessionID)
 })
@@ -234,7 +234,7 @@ test("outcome wiring expires an injected episode after two idle events", { concu
 
   const records = await waitForSpoolRecords(harness.worktree, 1)
   assert.equal(records.length, 1)
-  assert.equal(records[0].worked, false)
+  assert.equal(records[0].resolution, "unobserved")
   assert.equal(records[0].memory_hash, cid)
 })
 

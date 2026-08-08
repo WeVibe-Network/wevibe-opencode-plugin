@@ -25,14 +25,14 @@ function outcome(overrides: Partial<HarvestedOutcome> = {}): HarvestedOutcome {
     episodeRef: "a".repeat(64),
     evidenceRef: "b".repeat(64),
     memoryHash: "c".repeat(64),
-    worked: true,
+    resolution: "worked",
     needSignature: "need",
     ...overrides,
   };
 }
 
 function nonce(input = outcome()): string {
-  return deriveDeterministicNonceHex(input.orgId, input.memoryHash, input.episodeRef, input.worked);
+  return deriveDeterministicNonceHex(input.orgId, input.memoryHash, input.episodeRef, input.resolution);
 }
 
 function readRecords(stateDir: string): Array<Record<string, unknown>> {
@@ -282,7 +282,8 @@ test("posted body is content-free and has exactly the approved keys", async () =
       "org_id",
       "memory_hash",
       "episode_ref",
-      "worked",
+      "resolution",
+      "source",
       "evidence_ref",
       "session_id",
     ]);

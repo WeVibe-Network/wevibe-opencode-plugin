@@ -8,6 +8,7 @@ import {
   EpisodeTracker,
   type HarvestedOutcome,
   type OutcomeEvidence,
+  type OutcomeResolution,
 } from "./outcome-episode"
 
 const cidA = "a".repeat(64)
@@ -22,11 +23,11 @@ function assertHex64(value: string): void {
   assert.match(value, /^[0-9a-f]{64}$/)
 }
 
-function assertResolved(outcomes: HarvestedOutcome[], worked: boolean, cids: string[]): void {
+function assertResolved(outcomes: HarvestedOutcome[], resolution: OutcomeResolution, cids: string[]): void {
   assert.equal(outcomes.length, cids.length)
   assert.deepEqual(outcomes.map((o) => o.memoryHash), cids)
   for (const outcome of outcomes) {
-    assert.equal(outcome.worked, worked)
+    assert.equal(outcome.resolution, resolution)
     assertHex64(outcome.episodeRef)
     assertHex64(outcome.evidenceRef)
   }
@@ -86,7 +87,7 @@ test("open to build red-green resolves worked=true once per cid then closes", ()
     pre: { buildFailing: true, testFailing: false },
     post: { buildFailing: false, testFailing: false },
   })
-  assertResolved(outcomes, true, [cidA, cidB])
+  assertResolved(outcomes, "worked", [cidA, cidB])
 
   assert.deepEqual(
     tracker.observeToolResult({
@@ -132,7 +133,7 @@ test("test red-green resolves test_green", () => {
     post: { buildFailing: false, testFailing: false },
   })
 
-  assertResolved(outcomes, true, [cidA])
+  assertResolved(outcomes, "worked", [cidA])
   assert.equal(outcomes[0]?.evidenceRef, computeEvidenceRef(evidence))
 })
 
@@ -179,10 +180,10 @@ test("command_green resolves after same tool records nonzero then exits zero", (
     pre: { buildFailing: false, testFailing: false },
     post: { buildFailing: false, testFailing: false },
   })
-  assertResolved(outcomes, true, [cidA])
+  assertResolved(outcomes, "worked", [cidA])
 })
 
-test("two idle turns expire worked=false", () => {
+test("two idle turns expire resolution=unobserved (silence is not a vote)", () => {
   const tracker = new EpisodeTracker()
   tracker.openEpisode({
     orgId: "org",
@@ -196,11 +197,11 @@ test("two idle turns expire worked=false", () => {
 
   assert.deepEqual(tracker.onSessionIdle("s4"), [])
   const outcomes = tracker.onSessionIdle("s4")
-  assertResolved(outcomes, false, [cidA, cidB])
+  assertResolved(outcomes, "unobserved", [cidA, cidB])
   assert.deepEqual(tracker.onSessionIdle("s4"), [])
 })
 
-test("opening a superseding need closes the old episode worked=false", () => {
+test("opening a superseding need closes the old episode resolution=unobserved", () => {
   const tracker = new EpisodeTracker()
   tracker.openEpisode({
     orgId: "org",
@@ -221,7 +222,7 @@ test("opening a superseding need closes the old episode worked=false", () => {
     failing: { build: false, test: false },
     openedAtTurn: 2,
   })
-  assertResolved(expired, false, [cidA])
+  assertResolved(expired, "unobserved", [cidA])
   assert.equal(expired[0]?.needSignature, "old-need")
 })
 
@@ -250,11 +251,11 @@ test("invalid cids are dropped and cid cap keeps first 32 valid cids", () => {
   ])
 })
 
-test("deriveDeterministicNonceHex is deterministic 16-hex and changes when worked flips", () => {
+test("deriveDeterministicNonceHex is deterministic 16-hex and changes when resolution flips", () => {
   const episodeRef = computeEpisodeRef("org", "s7", "need")
-  const workedNonce = deriveDeterministicNonceHex("org", cidA, episodeRef, true)
-  const workedNonceAgain = deriveDeterministicNonceHex("org", cidA, episodeRef, true)
-  const failedNonce = deriveDeterministicNonceHex("org", cidA, episodeRef, false)
+  const workedNonce = deriveDeterministicNonceHex("org", cidA, episodeRef, "worked")
+  const workedNonceAgain = deriveDeterministicNonceHex("org", cidA, episodeRef, "worked")
+  const failedNonce = deriveDeterministicNonceHex("org", cidA, episodeRef, "unobserved")
 
   assert.match(workedNonce, /^[0-9a-f]{16}$/)
   assert.equal(workedNonce, workedNonceAgain)
