@@ -4,6 +4,8 @@ import test from "node:test"
 import {
   computeEpisodeRef,
   computeEvidenceRef,
+  computeUserVerdictEvidenceRef,
+  computeUserVerdictRef,
   deriveDeterministicNonceHex,
   EpisodeTracker,
   type HarvestedOutcome,
@@ -428,4 +430,65 @@ test("deriveDeterministicNonceHex is deterministic 16-hex and changes when resol
   assert.match(workedNonce, /^[0-9a-f]{16}$/)
   assert.equal(workedNonce, workedNonceAgain)
   assert.notEqual(workedNonce, failedNonce)
+})
+
+// D3 user-verdict namespace: deterministic refs that provably cannot collide
+// with real episode refs (different leading namespace token in the preimage).
+test("computeUserVerdictRef is deterministic and lives in a disjoint namespace from episode refs", () => {
+  const orgId = "org-uv"
+  const sessionId = "sess-uv"
+  const memoryHash = cidA
+  const ref = computeUserVerdictRef(orgId, sessionId, memoryHash, "accept")
+  const refAgain = computeUserVerdictRef(orgId, sessionId, memoryHash, "accept")
+  const denyRef = computeUserVerdictRef(orgId, sessionId, memoryHash, "deny")
+  const episodeRef = computeEpisodeRef(orgId, sessionId, "any-failure-key")
+
+  assertHex64(ref)
+  assert.equal(ref, refAgain)
+  assert.notEqual(ref, denyRef)
+
+  // Same inputs yield the identical hash as a reference sha256 over the exact
+  // preimage, proving determinism against the documented preimage string.
+  const expectedPreimage = `wevibe-user-verdict-v1\n${orgId}\n${sessionId}\n${memoryHash}\naccept`
+  assert.equal(ref, sha256Hex(expectedPreimage))
+
+  // The user-verdict namespace token is a distinct first line, so it can never
+  // equal an episode-v2 ref even for arbitrary failure keys.
+  assert.notEqual(ref, episodeRef)
+})
+
+test("computeUserVerdictEvidenceRef is deterministic and changes with action/timestamp", () => {
+  const orgId = "org-uv"
+  const sessionId = "sess-uv"
+  const memoryHash = cidB
+  const ts = 1_720_000_000_000
+  const ref = computeUserVerdictEvidenceRef(orgId, sessionId, memoryHash, "accept", ts)
+  const refAgain = computeUserVerdictEvidenceRef(orgId, sessionId, memoryHash, "accept", ts)
+  const denyRef = computeUserVerdictEvidenceRef(orgId, sessionId, memoryHash, "deny", ts)
+  const otherTsRef = computeUserVerdictEvidenceRef(orgId, sessionId, memoryHash, "accept", ts + 1)
+
+  assertHex64(ref)
+  assert.equal(ref, refAgain)
+  assert.notEqual(ref, denyRef)
+  assert.notEqual(ref, otherTsRef)
+
+  const expectedPreimage = `wevibe-user-verdict-evidence-v1\n${orgId}\n${sessionId}\n${memoryHash}\naccept\n${ts}`
+  assert.equal(ref, sha256Hex(expectedPreimage))
+})
+
+// The derived deterministic nonce uses the user-verdict episodeRef, so distinct
+// verdicts must yield distinct nonces (no cross-verdict event identity merge).
+test("user-verdict nonces stay distinct per (org, memory, verdict)", () => {
+  const orgId = "org-uv"
+  const sessionId = "sess-uv"
+  const acceptRef = computeUserVerdictRef(orgId, sessionId, cidA, "accept")
+  const denyRef = computeUserVerdictRef(orgId, sessionId, cidA, "deny")
+  const acceptNonce = deriveDeterministicNonceHex(orgId, cidA, acceptRef, "worked")
+  const denyNonce = deriveDeterministicNonceHex(orgId, cidA, denyRef, "didnt_work")
+  const episodeRef = computeEpisodeRef(orgId, sessionId, "failure-key")
+  const episodeNonce = deriveDeterministicNonceHex(orgId, cidA, episodeRef, "worked")
+
+  assert.notEqual(acceptNonce, denyNonce)
+  // A user verdict must not collide with a harvested episode close's nonce.
+  assert.notEqual(acceptNonce, episodeNonce)
 })

@@ -199,7 +199,7 @@ export function createOutcomeSpool(opts: OutcomeSpoolOptions): OutcomeSpool {
           episode_ref: outcome.episodeRef,
           evidence_ref: outcome.evidenceRef,
           resolution: outcome.resolution,
-          source: "harvested",
+          source: outcome.source ?? "harvested",
           nonce_hex: nonceHex,
           status: "pending",
           attempts: 0,

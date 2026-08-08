@@ -45,6 +45,9 @@ export interface HarvestedOutcome {
   memoryHash: string
   resolution: OutcomeResolution
   needSignature: string
+  // Defaults to "harvested" when absent. "user" marks a scripted gate / human
+  // TUI verdict, not a harvested episode close.
+  source?: "harvested" | "user"
 }
 
 interface EpisodeTrackerOptions {
@@ -111,6 +114,45 @@ export function computeEpisodeRef(orgId: string, sessionId: string, failureKey: 
 
 export function computeEvidenceRef(evidence: OutcomeEvidence): string {
   return sha256Hex(evidencePreimage(evidence))
+}
+
+// USER-VERDICT NAMESPACE (D3): a scripted gate answerer in a bench cell, or a
+// human TUI review verdict, is a distinct USER-VERDICT event — NOT an episode
+// close. Real episode refs live under the `wevibe-episode-v2` namespace keyed
+// by (org, session, failureKey); that namespace must never be reused for a gate
+// verdict because the deterministic outcome nonce (org + memoryHash +
+// episodeRef + resolution) treats episodeRef as part of the event identity, so
+// a collision would merge an episode close with a user verdict. This helper
+// derives a ref under a disjoint namespace `wevibe-user-verdict-v1` whose
+// preimage binds org + session + memoryHash + action. It is pure,
+// deterministic, and provably cannot collide with any `wevibe-episode-v2` ref
+// (different leading namespace token => different preimage => different hash).
+export function computeUserVerdictRef(
+  orgId: string,
+  sessionId: string,
+  memoryHash: string,
+  action: "accept" | "deny",
+): string {
+  return sha256Hex(`wevibe-user-verdict-v1\n${orgId}\n${sessionId}\n${memoryHash}\n${action}`)
+}
+
+// Deterministic evidence ref for a user verdict. Real evidence refs derive
+// from an OutcomeEvidence (kind/tool/commandFp8/failing flags/exitCode) via
+// `wevibe-evidence-v1`; a gate verdict carries no such evidence, so faking an
+// OutcomeEvidence would fabricate a command observation. This helper instead
+// hashes a stable preimage under its own namespace token
+// `wevibe-user-verdict-evidence-v1` binding the same decision identity (org,
+// session, memoryHash, action) plus the decision timestamp.
+export function computeUserVerdictEvidenceRef(
+  orgId: string,
+  sessionId: string,
+  memoryHash: string,
+  action: "accept" | "deny",
+  timestampMs: number,
+): string {
+  return sha256Hex(
+    `wevibe-user-verdict-evidence-v1\n${orgId}\n${sessionId}\n${memoryHash}\n${action}\n${timestampMs}`,
+  )
 }
 
 export function deriveDeterministicNonceHex(

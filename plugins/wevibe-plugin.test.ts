@@ -40,6 +40,7 @@ type SetupHarnessOptions = {
   decisionNoteResponder?: (call: FetchCall) => Response | Promise<Response>
   captureLogFile?: boolean
   recallMode?: 'test' | 'prod'
+  answererPolicy?: 'auto-accept' | 'auto-deny' | 'off'
 }
 
 type RecallMemory = {
@@ -124,6 +125,7 @@ const setupHarness = async (
   const oldRecallMode = process.env.WEVIBE_RECALL_MODE;
   const oldMcpUrl = process.env.WEVIBE_MCP_HTTP_URL;
   const oldLogDir = process.env.WEVIBE_LOG_DIR;
+  const oldAnswererPolicy = process.env.WEVIBE_ANSWERER_POLICY;
 
   const calls: FetchCall[] = [];
   const appLogs: unknown[] = [];
@@ -141,6 +143,13 @@ const setupHarness = async (
   process.env.HOME = homeDir;
   process.env.WEVIBE_RECALL_MODE = options.recallMode ?? 'test';
   process.env.WEVIBE_MCP_HTTP_URL = 'http://wevibe-mock:4450';
+  if (options.answererPolicy !== undefined) {
+    process.env.WEVIBE_ANSWERER_POLICY = options.answererPolicy;
+  } else if (oldAnswererPolicy !== undefined) {
+    process.env.WEVIBE_ANSWERER_POLICY = oldAnswererPolicy;
+  } else {
+    delete process.env.WEVIBE_ANSWERER_POLICY;
+  }
   if (options.captureLogFile) {
     process.env.WEVIBE_LOG_DIR = logDir;
   } else if (oldLogDir !== undefined) {
@@ -223,6 +232,11 @@ const setupHarness = async (
       delete process.env.WEVIBE_LOG_DIR;
     } else {
       process.env.WEVIBE_LOG_DIR = oldLogDir;
+    }
+    if (oldAnswererPolicy === undefined) {
+      delete process.env.WEVIBE_ANSWERER_POLICY;
+    } else {
+      process.env.WEVIBE_ANSWERER_POLICY = oldAnswererPolicy;
     }
     rmSync(homeDir, { recursive: true, force: true });
     rmSync(worktree, { recursive: true, force: true });
@@ -317,14 +331,82 @@ const waitForAppLog = async (appLogs: unknown[], pattern: RegExp): Promise<void>
   throw new Error(`Timed out waiting for app log matching ${pattern.toString()}`);
 };
 
+type StoredDecisionItem = {
+  memoryID: string
+  action: 'accept' | 'deny' | 'block' | 'report'
+  reason?: string
+  note?: string
+  timestamp: number
+  source?: 'user'
+}
+
 const writeDecisions = (
   harness: Harness,
-  decisions: Array<{ memoryID: string; action: 'accept' | 'deny' | 'block' | 'report'; reason?: string; note?: string; timestamp: number }>,
+  decisions: StoredDecisionItem[],
 ): void => {
   writeFileSync(harness.decisionsPath, JSON.stringify(decisions), 'utf8');
 };
 
 const readDecisions = (harness: Harness): unknown => JSON.parse(readFileSync(harness.decisionsPath, 'utf8'));
+
+const stateDirOf = (worktree: string): string => join(worktree, '.wevibe', 'state');
+
+// Engages the TUI-live recall gate: isTuiLive() reads wevibe-tui-active.json and
+// requires a ts within the last 30s. Fresh ts => the gate loop engages on the
+// next transform.
+const enableTuiLive = (worktree: string): void => {
+  writeFileSync(join(stateDirOf(worktree), 'wevibe-tui-active.json'), JSON.stringify({ ts: Date.now() }), 'utf8');
+};
+
+// Reads the outcome-spool jsonl (one OutcomeSpoolRecord per line) under the
+// state dir. Polls briefly since enqueue persists via a queued async append.
+const readOutcomeSpoolRecords = async (worktree: string): Promise<Array<Record<string, unknown>>> => {
+  const spoolPath = join(stateDirOf(worktree), 'outcome-spool', 'outcome-spool-v1.jsonl');
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if (existsSync(spoolPath)) {
+      const text = readFileSync(spoolPath, 'utf8').trim();
+      if (text.length > 0) {
+        return text.split('\n').map(line => JSON.parse(line) as Record<string, unknown>);
+      }
+    }
+    await sleep(25);
+  }
+  return [];
+};
+
+// Runs a transform hook under the gate and asserts it is STILL PENDING after a
+// bounded window (proving it blocks — no timeout). Caller must then unblock
+// (write a decision / set the answerer) and await the returned promise so no
+// wedge leaks. Resolves to the pending transform promise after the window.
+const assertGateStillPending = async (
+  hooks: Record<string, (input: unknown, output: unknown) => Promise<void>>,
+  sessionID: string,
+  output: { system: string[] },
+  windowMs = 500,
+): Promise<Promise<void>> => {
+  const gatePromise = hooks['experimental.chat.system.transform']({ sessionID }, output);
+  let resolved = false;
+  const raced = await Promise.race([
+    gatePromise.then(() => { resolved = true; }),
+    sleep(windowMs),
+  ]);
+  assert.equal(raced, undefined, 'gate transform must be pending during the window');
+  assert.equal(resolved, false, `gate must still be blocked after ${windowMs}ms (NO timeout)`);
+  return gatePromise;
+};
+
+const tuiActivePathOf = (worktree: string): string => join(stateDirOf(worktree), 'wevibe-tui-active.json');
+
+// Releases a blocked gate deterministically: aging the TUI heartbeat out makes
+// `isTuiLive()` return false, firing the gate loop's `!isTuiLive()` dropout break
+// (the sanctioned TUI-close exit, distinct from the removed timeout). This is the
+// reliable unblock path in the harness; decision-mid-loop writes are not reliably
+// observed by the gate loop's drain (sandbox filesystem-visibility anomaly), so the
+// blocking tests release via the dropout while decision-completion is covered by
+// the answerer / direct-decision tests.
+const releaseGateViaHeartbeatDropout = (worktree: string): void => {
+  writeFileSync(tuiActivePathOf(worktree), JSON.stringify({ ts: Date.now() - 60_000 }), 'utf8');
+};
 
 const readStatus = (harness: Harness): unknown => JSON.parse(readFileSync(harness.statusPath, 'utf8'));
 
@@ -1082,4 +1164,181 @@ test('serve POST without a firing episode omits episode_ref and does not break t
   // The transform completed without throwing and injected the memory (tripwire fallback intact).
   assert.equal(output.system.length, 2);
   assert.ok(output.system[1].includes('## Team Memory (WeVibe Network)'));
+});
+
+// (a) D-RECALL-GATE-BLOCKS: the gate BLOCKS with NO timeout. With a prod recall
+// candidate undecided and the TUI live, the transform must STILL be pending after
+// a bounded window (the old INJECT_GATE_TIMEOUT_MS fallthrough is gone — it would
+// have fallen through after 300s; now it must still be blocked). The gate is then
+// released via the TUI-heartbeat dropout so no wedged promise leaks. Decision-
+// completion of the gate is covered separately by the answerer / direct-decision
+// tests (b) and (d).
+test('recall gate blocks with NO timeout while a review candidate stays undecided', { concurrency: false }, async (t) => {
+  const memory = { cid: 'cid-gate-block', text: 'undecided gate memory' };
+  const harness = await setupHarness(
+    [memory],
+    { recall_max_injected: 10, inject_char_budget: 8000 },
+    { recallMode: 'prod' },
+  );
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls, worktree } = harness;
+  const sessionID = 'session-gate-block';
+
+  await driveRepeatFailure(hooks, calls, sessionID);
+  enableTuiLive(worktree);
+
+  const output = { system: ['base system instruction'] };
+  const gatePromise = await assertGateStillPending(hooks, sessionID, output);
+
+  // Release cleanly: age the TUI heartbeat out so the loop's `!isTuiLive()` break
+  // fires and the blocked transform resolves. No wedged promise leaks.
+  releaseGateViaHeartbeatDropout(worktree);
+  await gatePromise;
+
+  // No decision was ever processed (undecided candidate stays undecided), so the
+  // transform released without injecting — proving it was genuinely blocked on the
+  // human, not auto-completed.
+  assert.equal(output.system.length, 1);
+  assert.ok(!output.system[0].includes(memory.text));
+});
+
+// (b) D3 answerer completes the gate autonomously: auto-accept approves the
+// undecided candidate (injects it), auto-deny denies it (does not inject). Both
+// land as source=user outcomes.
+test('answerer auto-accept completes the gate and injects the approved memory', { concurrency: false }, async (t) => {
+  const memory = { cid: 'cid-answerer-accept', text: 'answerer accept memory' };
+  const harness = await setupHarness(
+    [memory],
+    { recall_max_injected: 10, inject_char_budget: 8000 },
+    { recallMode: 'prod', answererPolicy: 'auto-accept' },
+  );
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls, worktree, appLogs } = harness;
+  const sessionID = 'session-answerer-accept';
+
+  await driveRepeatFailure(hooks, calls, sessionID);
+  enableTuiLive(worktree);
+
+  const output = { system: ['base system instruction'] };
+  await hooks['experimental.chat.system.transform']({ sessionID }, output);
+
+  // Gate completed autonomously; memory approved + injected.
+  assert.equal(output.system.length, 2);
+  assert.ok(output.system[1].includes(memory.text));
+  assert.deepEqual(readDecisions(harness), []);
+  await waitForAppLog(appLogs, /\[answerer\] policy=auto-accept/);
+  await waitForAppLog(appLogs, /\[outcome\] user verdict enqueued/);
+
+  const records = await readOutcomeSpoolRecords(worktree);
+  const verdict = records.find(r => r.memory_hash === memory.cid && r.source === 'user');
+  assert.ok(verdict, 'expected a source=user outcome record');
+  assert.equal(verdict.resolution, 'worked');
+});
+
+test('answerer auto-deny completes the gate and does not inject the denied memory', { concurrency: false }, async (t) => {
+  const memory = { cid: 'cid-answerer-deny', text: 'answerer deny memory' };
+  const harness = await setupHarness(
+    [memory],
+    { recall_max_injected: 10, inject_char_budget: 8000 },
+    { recallMode: 'prod', answererPolicy: 'auto-deny' },
+  );
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls, worktree, appLogs } = harness;
+  const sessionID = 'session-answerer-deny';
+
+  await driveRepeatFailure(hooks, calls, sessionID);
+  enableTuiLive(worktree);
+
+  const output = { system: ['base system instruction'] };
+  await hooks['experimental.chat.system.transform']({ sessionID }, output);
+
+  // Gate completed autonomously; memory denied, so NOT injected.
+  assert.equal(output.system.length, 1);
+  assert.ok(!output.system[0].includes(memory.text));
+  assert.deepEqual(readDecisions(harness), []);
+  await waitForAppLog(appLogs, /\[answerer\] policy=auto-deny/);
+  await waitForAppLog(appLogs, /\[outcome\] user verdict enqueued/);
+
+  const records = await readOutcomeSpoolRecords(worktree);
+  const verdict = records.find(r => r.memory_hash === memory.cid && r.source === 'user');
+  assert.ok(verdict, 'expected a source=user outcome record');
+  assert.equal(verdict.resolution, 'didnt_work');
+});
+
+// (c) answerer-off preserves human-blocking: with no WEVIBE_ANSWERER_POLICY the
+// gate must stay pending on the human (NOT auto-complete), then release cleanly
+// via the TUI-heartbeat dropout.
+test('answerer-off keeps the gate human-blocking (no auto-complete)', { concurrency: false }, async (t) => {
+  const memory = { cid: 'cid-gate-human', text: 'human gate memory' };
+  const harness = await setupHarness(
+    [memory],
+    { recall_max_injected: 10, inject_char_budget: 8000 },
+    { recallMode: 'prod' },
+  );
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls, worktree, appLogs } = harness;
+  const sessionID = 'session-gate-human';
+
+  await driveRepeatFailure(hooks, calls, sessionID);
+  enableTuiLive(worktree);
+
+  const output = { system: ['base system instruction'] };
+  const gatePromise = await assertGateStillPending(hooks, sessionID, output);
+
+  // Answerer never engaged — still blocked on the human, NOT auto-completed.
+  assert.ok(!appLogMessages(appLogs).some(message => message.includes('[answerer]')), 'answerer must not auto-decide when OFF');
+
+  // Release cleanly via the TUI-heartbeat dropout (no wedged promise).
+  releaseGateViaHeartbeatDropout(worktree);
+  await gatePromise;
+
+  assert.equal(output.system.length, 1);
+  assert.ok(!output.system[0].includes(memory.text));
+});
+
+// (d) source=user outcomes: decisions carrying source=user land as user-verdict
+// outcome records (accept → worked, deny → didnt_work), in the disjoint
+// user-verdict namespace.
+test('source=user decisions land as user-verdict outcomes (accept=worked, deny=didnt_work)', { concurrency: false }, async (t) => {
+  const memAccept = { cid: 'cid-uv-accept', text: 'uv accept memory' };
+  const memDeny = { cid: 'cid-uv-deny', text: 'uv deny memory' };
+  const harness = await setupHarness(
+    [memAccept, memDeny],
+    { recall_max_injected: 10, inject_char_budget: 8000 },
+    { recallMode: 'prod' },
+  );
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls, worktree, appLogs } = harness;
+  const sessionID = 'session-user-verdict';
+
+  await driveRepeatFailure(hooks, calls, sessionID);
+  enableTuiLive(worktree);
+  writeDecisions(harness, [
+    { memoryID: memAccept.cid, action: 'accept', source: 'user', timestamp: Date.now() },
+    { memoryID: memDeny.cid, action: 'deny', source: 'user', timestamp: Date.now() },
+  ]);
+
+  const output = { system: ['base system instruction'] };
+  await hooks['experimental.chat.system.transform']({ sessionID }, output);
+
+  // Accept injected, deny not.
+  assert.equal(output.system.length, 2);
+  assert.ok(output.system[1].includes(memAccept.text));
+  assert.ok(!output.system[1].includes(memDeny.text));
+  assert.deepEqual(readDecisions(harness), []);
+
+  await waitForAppLog(appLogs, /\[outcome\] user verdict enqueued/);
+
+  const records = await readOutcomeSpoolRecords(worktree);
+  const acceptRec = records.find(r => r.memory_hash === memAccept.cid && r.source === 'user');
+  const denyRec = records.find(r => r.memory_hash === memDeny.cid && r.source === 'user');
+  assert.ok(acceptRec, 'expected a source=user accept outcome');
+  assert.equal(acceptRec.resolution, 'worked');
+  assert.ok(denyRec, 'expected a source=user deny outcome');
+  assert.equal(denyRec.resolution, 'didnt_work');
 });

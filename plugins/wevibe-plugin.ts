@@ -9,7 +9,12 @@ import { detectBinding, type BindingState } from "./binding"
 import { resolveScopedWeVibeDir, scopedLogDir, scopedRunsDir, scopedStateDir } from "./wevibe-paths"
 import { createSpool, excerpt, fp8, type Spool } from "./gstv-spool"
 import { GSTV_BOUNDARY_TIMEOUT_MS, onSessionCreated, onSessionIdle, type GstvHookDeps } from "./gstv-hooks"
-import { EpisodeTracker, type HarvestedOutcome } from "./outcome-episode"
+import {
+  EpisodeTracker,
+  computeUserVerdictEvidenceRef,
+  computeUserVerdictRef,
+  type HarvestedOutcome,
+} from "./outcome-episode"
 import { computeFailureKey } from "./failure-key"
 import { resolvePredicateAdapter, registerPredicateAdapter } from "./predicate-adapter"
 import { benchFixtureAdapter } from "./bench-fixture-adapter"
@@ -56,6 +61,8 @@ interface StoredDecision {
   action: "accept" | "deny" | "block" | "report"
   reason?: string
   note?: string
+  // A human TUI / bench-cell answerer verdict is a user decision.
+  source?: "user"
   timestamp: number
 }
 
@@ -227,7 +234,6 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   }
   const RECALL_IN_FLIGHT_AWAIT_TIMEOUT_MS = 15_000
   const INJECT_GATE_POLL_INTERVAL_MS = 250
-  const INJECT_GATE_TIMEOUT_MS = 300_000
   const SERVED_MEMORIES_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 
   const readJson = <T>(filePath: string, fallback: T): T => {
@@ -381,6 +387,19 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   function getRecallMode(): "prod" | "test" {
     const mode = process.env.WEVIBE_RECALL_MODE?.trim().toLowerCase()
     return mode === "test" ? "test" : "prod"
+  }
+
+  // D3 answerer policy surface (D-RECALL-GATE-BLOCKS exception). The gate is
+  // human-blocking by default; a bench cell may opt in to a scripted answerer
+  // via WEVIBE_ANSWERER_POLICY=auto-accept|auto-deny, which auto-writes a
+  // source=user decision for every undecided cid so the gate completes without
+  // a human. Any unset/unknown value keeps the answerer OFF (strict no-op) and
+  // the gate fully human-blocking.
+  function getAnswererPolicy(): "auto-accept" | "auto-deny" | "off" {
+    const raw = process.env.WEVIBE_ANSWERER_POLICY?.trim().toLowerCase()
+    if (raw === "auto-accept") return "auto-accept"
+    if (raw === "auto-deny") return "auto-deny"
+    return "off"
   }
 
   function getRecallGovernorConfig(): RecallGovernorConfig {
@@ -792,6 +811,42 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
     writeJson(statusPath, snapshot)
   }
 
+  // D3 outcome bridge (source=user): a scripted gate answerer / human TUI
+  // verdict on a review candidate is a distinct USER-VERDICT event, not an
+  // episode close. Only decisions whose `source === "user"` with a verdict
+  // action (accept/deny) enqueue a HarvestedOutcome; ordinary harvested
+  // decisions (no source) flow through the cid-set mutations untouched. The
+  // refs come from the disjoint `wevibe-user-verdict-v1` namespace so the
+  // deterministic outcome nonce can never collide with a real episode ref.
+  // Best-effort and synchronous: an enqueue throw must never break the gate
+  // drain, and an unbound session just logs and continues (no fabricated org).
+  const bridgeUserVerdict = (decision: StoredDecision, action: "accept" | "deny", resolution: "worked" | "didnt_work"): void => {
+    if (decision.source !== "user") {
+      return
+    }
+    if (!bindingState.active || !bindingState.orgId) {
+      logPlugin("info", `[outcome] user verdict skipped (session unbound) cid_fp=${fp8(decision.memoryID)} action=${action}`)
+      return
+    }
+    try {
+      const orgId = bindingState.orgId
+      const sessionId = currentSessionId()
+      outcomeSpool.enqueue({
+        orgId,
+        sessionId,
+        memoryHash: decision.memoryID,
+        episodeRef: computeUserVerdictRef(orgId, sessionId, decision.memoryID, action),
+        evidenceRef: computeUserVerdictEvidenceRef(orgId, sessionId, decision.memoryID, action, decision.timestamp),
+        resolution,
+        needSignature: "user-verdict",
+        source: "user",
+      })
+      logPlugin("info", `[outcome] user verdict enqueued cid_fp=${fp8(decision.memoryID)} resolution=${resolution}`)
+    } catch (err) {
+      logPlugin("warn", `[outcome] user verdict enqueue failed reason=${excerpt(err instanceof Error ? err.message : String(err), 200)} cid_fp=${fp8(decision.memoryID)}`)
+    }
+  }
+
   const drainDecisions = async (): Promise<void> => {
     const decisions = readJson<StoredDecision[]>(decisionPath, [])
     if (decisions.length === 0) {
@@ -812,6 +867,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         approvedCids.add(decision.memoryID)
         deniedCids.delete(decision.memoryID)
         reportedCids.delete(decision.memoryID)
+        bridgeUserVerdict(decision, "accept", "worked")
         continue
       }
 
@@ -819,6 +875,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         approvedCids.delete(decision.memoryID)
         deniedCids.add(decision.memoryID)
         reportedCids.delete(decision.memoryID)
+
+        bridgeUserVerdict(decision, "deny", "didnt_work")
 
         const noteToken = readWeVibeMcpToken()
         if (noteToken && bindingState.active && bindingState.orgId) {
@@ -895,6 +953,41 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 
     writeJson(decisionPath, [])
     recordStatusSnapshot()
+  }
+
+  // D3 scripted gate answerer (D-RECALL-GATE-BLOCKS exception). When the
+  // answerer policy is ON, this writes a source=user decision for every
+  // currently-undecided cid into the decisions file, so the blocking loop's
+  // next drainDecisions() picks them up and emits the user-verdict outcome.
+  // When the policy is OFF this is a strict no-op and the gate remains fully
+  // human-blocking. Best-effort and synchronous: an answerer throw must never
+  // crash the gate.
+  const answerPendingGate = (pendingCids: Set<string>): void => {
+    const policy = getAnswererPolicy()
+    if (policy === "off" || pendingCids.size === 0) {
+      return
+    }
+    const action: "accept" | "deny" = policy === "auto-accept" ? "accept" : "deny"
+    try {
+      const existing = readJson<StoredDecision[]>(decisionPath, [])
+      const queuedById = new Set(existing.map(d => d.memoryID))
+      const now = Date.now()
+      let wrote = 0
+      for (const cid of pendingCids) {
+        // Only cids still genuinely undecided (still cached, not in any verdict set).
+        if (!cachedMemories.some(m => m.cid === cid)) continue
+        if (approvedCids.has(cid) || deniedCids.has(cid) || reportedCids.has(cid)) continue
+        if (queuedById.has(cid)) continue
+        existing.push({ memoryID: cid, action, source: "user", timestamp: now })
+        wrote++
+      }
+      if (wrote > 0) {
+        writeJson(decisionPath, existing)
+        logPlugin("info", `[answerer] policy=${policy} wrote=${wrote} pending=${pendingCids.size}`)
+      }
+    } catch (err) {
+      logPlugin("warn", `[answerer] decision write failed reason=${excerpt(err instanceof Error ? err.message : String(err), 200)}`)
+    }
   }
 
   const submitReport = async (
@@ -1760,20 +1853,18 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 
       let pendingUndecidedCids = getPendingUndecidedCids()
       if (isTuiLive() && pendingUndecidedCids.size > 0) {
-        const gateStartedAt = Date.now()
-
         while (pendingUndecidedCids.size > 0) {
           if (!isTuiLive()) {
             break
           }
 
-          if (Date.now() - gateStartedAt >= INJECT_GATE_TIMEOUT_MS) {
-            logDebug(`[recall] transform gate timeout pending=${pendingUndecidedCids.size}`)
-            break
-          }
-
           await new Promise(resolve => setTimeout(resolve, INJECT_GATE_POLL_INTERVAL_MS))
           await drainDecisions()
+          // D3 scripted gate answerer: when the policy is ON, fills source=user
+          // decisions for any cids still undecided so the next drain picks them
+          // up. When OFF it is a strict no-op and the loop keeps blocking on a
+          // human (D-RECALL-GATE-BLOCKS, human-blocking exception).
+          answerPendingGate(pendingUndecidedCids)
           pendingUndecidedCids = getPendingUndecidedCids()
         }
       }

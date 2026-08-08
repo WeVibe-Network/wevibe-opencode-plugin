@@ -52,6 +52,9 @@ type QueueDecision = {
   reason?: ReportReason;
   note?: string;
   timestamp: number;
+  // A human TUI review verdict is a user decision, distinct from harvested
+  // episode closes (see plugins/wevibe-plugin.ts drainDecisions).
+  source?: "user";
 };
 
 type RiskColor = "red" | "amber" | "green";
@@ -455,7 +458,7 @@ const tui = async (api: any, options: PluginOptions | undefined, _meta: unknown)
   const recordDecision = (decision: QueueDecision) => {
     try {
       const decisions = readJsonArray<QueueDecision>(decisionsPath);
-      decisions.push(decision);
+      decisions.push({ ...decision, source: "user" });
       if (writeJsonArray(decisionsPath, decisions)) {
         removeFromQueue(decision.memoryID);
       }
