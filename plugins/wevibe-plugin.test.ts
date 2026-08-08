@@ -16,6 +16,8 @@ import { computeEpisodeRef } from './outcome-episode.ts';
 import { fp8 } from './gstv-spool.ts';
 // @ts-expect-error tsx test runner resolves .ts extension imports.
 import { clearPredicateCache } from './predicate-binding.ts';
+// @ts-expect-error tsx test runner resolves .ts extension imports.
+import { snapshot, resetFunnelCountersTrackers } from './funnel-counters.ts';
 
 type FetchCall = {
   url: string
@@ -38,6 +40,7 @@ type Harness = {
 type SetupHarnessOptions = {
   recallResponder?: (call: FetchCall) => Response | Promise<Response>
   decisionNoteResponder?: (call: FetchCall) => Response | Promise<Response>
+  confirmResponder?: (call: FetchCall) => Response | Promise<Response>
   captureLogFile?: boolean
   recallMode?: 'test' | 'prod'
   answererPolicy?: 'auto-accept' | 'auto-deny' | 'off'
@@ -187,6 +190,12 @@ const setupHarness = async (
     }
     if (url.endsWith('/v1/serves')) {
       return toJsonResponse(200, { status: 'ok' });
+    }
+    if (url.includes('/serves/confirm')) {
+      if (options.confirmResponder) {
+        return options.confirmResponder(call);
+      }
+      return toJsonResponse(200, { serves: [] });
     }
     if (url.endsWith('/v1/shutdown')) {
       return toJsonResponse(200, { status: 'ok' });
@@ -1164,6 +1173,96 @@ test('serve POST without a firing episode omits episode_ref and does not break t
   // The transform completed without throwing and injected the memory (tripwire fallback intact).
   assert.equal(output.system.length, 2);
   assert.ok(output.system[1].includes('## Team Memory (WeVibe Network)'));
+});
+
+// ---------------------------------------------------------------------------
+// Confirmed-on-chain serve receipts (WO-TRIGGER-BUILD A8): the relay confirm
+// proxy read drives the confirmed_on_chain funnel counter; fail-closed on error.
+// ---------------------------------------------------------------------------
+
+const confirmCalls = (calls: FetchCall[]): FetchCall[] => calls.filter(call => call.url.includes('/serves/confirm'));
+
+const waitForConfirmCount = async (calls: FetchCall[], expected: number): Promise<void> => {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if (confirmCalls(calls).length >= expected) return;
+    await sleep(25);
+  }
+  throw new Error(`Timed out waiting for ${expected} confirm reads`);
+};
+
+const waitForConfirmed = async (sessionID: string, expected: number): Promise<void> => {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if ((snapshot(sessionID)?.confirmed_on_chain ?? 0) === expected) return;
+    await sleep(25);
+  }
+  throw new Error(`Timed out waiting for confirmed_on_chain=${expected} on ${sessionID}`);
+};
+
+test('confirmed_on_chain counts receipts that are submitted with a tx_hash via the relay confirm GET', { concurrency: false }, async (t) => {
+  resetFunnelCountersTrackers();
+  const harness = await setupHarness(
+    [{ cid: 'c7'.repeat(32), text: 'confirmed memory' }],
+    { recall_max_injected: 10, inject_char_budget: 8000 },
+    {
+      confirmResponder: () =>
+        toJsonResponse(200, {
+          serves: [
+            { id: 'r1', memory_content_hash: 'c7'.repeat(32), episode_ref: 'x', status: 'submitted', tx_hash: '0xabc', created_at: '', submitted_at: '' },
+            { id: 'r2', memory_content_hash: 'c7'.repeat(32), episode_ref: 'x', status: 'submitted', tx_hash: null, created_at: '', submitted_at: '' },
+            { id: 'r3', memory_content_hash: 'c7'.repeat(32), episode_ref: 'x', status: 'pending', tx_hash: '0xdef', created_at: '', submitted_at: '' },
+          ],
+        }),
+    },
+  );
+  t.after(() => {
+    harness.cleanup();
+    resetFunnelCountersTrackers();
+  });
+
+  const { hooks, calls } = harness;
+  const sessionID = 'session-confirmed-integration';
+
+  await driveRepeatFailure(hooks, calls, sessionID);
+  const output = { system: ['base system'] };
+  await hooks['experimental.chat.system.transform']({ sessionID }, output);
+
+  // The confirm proxy was read over the relay with the firing episode_ref.
+  await waitForConfirmCount(calls, 1);
+  const confirms = confirmCalls(calls);
+  assert.equal(confirms.length, 1);
+  assert.equal(confirms[0].method, 'GET');
+  assert.ok(confirms[0].url.includes('org-test'), 'confirm URL must carry the bound org id');
+  assert.ok(confirms[0].url.includes('episode_ref='), 'confirm URL must carry episode_ref');
+  assert.match(confirms[0].headers?.['X-WeVibe-Trace-Id'] as string, /^[0-9a-f]{8}$/, 'confirm read must carry a trace id');
+
+  // Only the submitted+tx_hash receipt is counted (1 of 3).
+  await waitForConfirmed(sessionID, 1);
+  assert.equal(snapshot(sessionID)?.confirmed_on_chain, 1);
+});
+
+test('confirmed_on_chain fails closed (unchanged, no throw) when the relay confirm errors', { concurrency: false }, async (t) => {
+  resetFunnelCountersTrackers();
+  const harness = await setupHarness(
+    [{ cid: 'c8'.repeat(32), text: 'fail-closed memory' }],
+    { recall_max_injected: 10, inject_char_budget: 8000 },
+    { confirmResponder: () => toJsonResponse(500, { error: 'relay exploded' }) },
+  );
+  t.after(() => {
+    harness.cleanup();
+    resetFunnelCountersTrackers();
+  });
+
+  const { hooks, calls } = harness;
+  const sessionID = 'session-confirmed-failclosed';
+
+  await driveRepeatFailure(hooks, calls, sessionID);
+  const output = { system: ['base system'] };
+  await hooks['experimental.chat.system.transform']({ sessionID }, output);
+
+  // The transform completed without throwing despite the failed confirm read.
+  await waitForConfirmCount(calls, 1);
+  assert.ok(output.system.length >= 1);
+  assert.equal(snapshot(sessionID)?.confirmed_on_chain ?? 0, 0, 'confirmed_on_chain must remain unconfirmed on relay error');
 });
 
 // (a) D-RECALL-GATE-BLOCKS: the gate BLOCKS with NO timeout. With a prod recall

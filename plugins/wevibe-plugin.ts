@@ -4,6 +4,7 @@ import { homedir } from "os"
 import { fileURLToPath } from "node:url"
 import { createHash, randomUUID } from "node:crypto"
 import { SessionMetricsRecorder, assessRecallNeed, extractToolExitCode } from "./metrics"
+import { createFunnelCountersTracker, type FunnelCountersTracker } from "./funnel-counters"
 import { buildRecallHarvest, type RecallHarvestSignals } from "./recall-harvest"
 import { detectBinding, type BindingState } from "./binding"
 import { resolveScopedWeVibeDir, scopedLogDir, scopedRunsDir, scopedStateDir } from "./wevibe-paths"
@@ -562,6 +563,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   })
   const gstvBoundaryRan = new Set<string>()
   const toolCallStartedAt = new Map<string, number>()
+  const funnelCounters: FunnelCountersTracker = createFunnelCountersTracker()
   const firedEpisodeBySession = new Map<string, { failureKey: string; episodeRef: string }>()
   // C3b flake guard: a repeat red only arms if a file-edit occurred since the last red.
   const editSeenBySession = new Map<string, boolean>()
@@ -1580,14 +1582,15 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
   }
 
   let recallInFlight: Promise<void> | null = null
-  const triggerRecall = (query: string, trigger: RecallTrigger): void => {
+  const triggerRecall = (sessionId: string, query: string, trigger: RecallTrigger): void => {
     if (!wevibeAvailable || !bindingState.active) {
       logPlugin("info", "[binding] recall suppressed: session dormant (unbound)")
       return
     }
     if (recallInFlight) return
     const trace = newTrace()
-    logPlugin("info", `recall_fired trigger=${trigger} sid=${currentSessionId() ?? "unknown"}`, trace)
+    funnelCounters.recallFired(sessionId)
+    logPlugin("info", `recall_fired trigger=${trigger} sid=${sessionId}`, trace)
     recallInFlight = loadMemories(query, trace).catch(() => undefined).finally(() => { recallInFlight = null })
   }
 
@@ -1853,6 +1856,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
 
       let pendingUndecidedCids = getPendingUndecidedCids()
       if (isTuiLive() && pendingUndecidedCids.size > 0) {
+        funnelCounters.gateShown(currentSessionId())
+        funnelCounters.beginGate(currentSessionId())
         while (pendingUndecidedCids.size > 0) {
           if (!isTuiLive()) {
             break
@@ -1867,6 +1872,8 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           answerPendingGate(pendingUndecidedCids)
           pendingUndecidedCids = getPendingUndecidedCids()
         }
+        funnelCounters.gateDecided(currentSessionId())
+        funnelCounters.endGate(currentSessionId())
       }
 
       const tuiLiveForLog = isTuiLive()
@@ -2018,6 +2025,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           const boundOrg = bindingState.orgId
           const serveTrace = newTrace()
           logPlugin("info", `[serve] upsert cid=${mem.cid} sid=${sid}`, serveTrace)
+          funnelCounters.serveSent(sid)
           fetch(`${WEVIBE_MCP_HTTP}/v1/serves`, {
             method: "POST",
             headers: {
@@ -2050,6 +2058,48 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
               logPlugin("warn", `[serve] receipt failed reason=${excerpt(err instanceof Error ? err.message : String(err), 200)} cid_fp=${fp8(mem.cid)}`, serveTrace)
             })
         }
+      }
+
+      // Confirmed-on-chain serve receipts (WO-TRIGGER-BUILD A8): best-effort read
+      // of the relay confirm proxy for the firing episode. Fire-and-forget so it
+      // never blocks the hook (non-blocking invariant); fail-closed on any error
+      // leaves confirmed_on_chain unchanged (unconfirmed) and never throws.
+      if (firedEpisode?.episodeRef && bindingState.active && bindingState.orgId) {
+        const boundOrg = bindingState.orgId
+        const episodeRef = firedEpisode.episodeRef
+        const confirmTrace = newTrace()
+        void (async () => {
+          try {
+            const token = readWeVibeMcpToken()
+            if (!token) {
+              logPlugin("warn", `[confirm] skipped: no mcp token episode_fp=${fp8(episodeRef)}`, confirmTrace)
+              return
+            }
+            const res = await fetch(
+              `${WEVIBE_MCP_HTTP}/v1/orgs/${encodeURIComponent(boundOrg)}/serves/confirm?episode_ref=${encodeURIComponent(episodeRef)}`,
+              {
+                method: "GET",
+                headers: {
+                  "Authorization": `Bearer ${token}`,
+                  "X-WeVibe-Trace-Id": confirmTrace,
+                },
+                signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+              },
+            )
+            if (!res.ok) {
+              logPlugin("warn", `[confirm] read failed status=${res.status} episode_fp=${fp8(episodeRef)}`, confirmTrace)
+              return
+            }
+            const body = (await res.json()) as {
+              serves?: Array<{ status?: string; tx_hash?: string | null }>
+            }
+            const confirmed = (body.serves ?? []).filter(s => s.status === "submitted" && Boolean(s.tx_hash)).length
+            funnelCounters.recordConfirmed(sid, confirmed)
+            logPlugin("info", `[confirm] episode_fp=${fp8(episodeRef)} confirmed=${confirmed}`, confirmTrace)
+          } catch (err) {
+            logPlugin("warn", `[confirm] read failed reason=${excerpt(err instanceof Error ? err.message : String(err), 200)} episode_fp=${fp8(episodeRef)}`, confirmTrace)
+          }
+        })()
       }
       upsertServedMemories(newlyServed.map(m => ({ cid: m.cid, text: m.text })), sid)
     },
@@ -2223,10 +2273,12 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           const failureKey = computeFailureKey({ repoBinding: bindingState.fingerprint ?? "", predicateId: tripwirePredicateId, failingTest: null, commandFp8 })
           const episode = episodeTracker.openOrTouch({ ...baseOpenInput, failureKey, predicateId: tripwirePredicateId, testId: null })
           enqueueHarvestedOutcomes(needSessionId, episode.expired)
+          if (episode.opened) funnelCounters.episodeOpened(needSessionId)
           if (!episode.opened && !episode.fired && editSeen && wevibeAvailable && bindingState.active && !recallInFlight) {
             episodeTracker.markFired(needSessionId, failureKey)
             firedEpisodeBySession.set(needSessionId, { failureKey, episodeRef: episode.episodeRef })
-            triggerRecall(need.query, "repeat_failure")
+            funnelCounters.episodeArmed(needSessionId)
+            triggerRecall(needSessionId, need.query, "repeat_failure")
           }
         } else {
           const sortedIds = [...failingIds].sort()
@@ -2234,12 +2286,14 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
             const failureKey = computeFailureKey({ repoBinding: bindingState.fingerprint ?? "", predicateId, failingTest: testId, commandFp8 })
             const episode = episodeTracker.openOrTouch({ ...baseOpenInput, failureKey, predicateId, testId })
             enqueueHarvestedOutcomes(needSessionId, episode.expired)
+            if (episode.opened) funnelCounters.episodeOpened(needSessionId)
             if (index === 0) {
               // C3a cascade: only the FIRST failing id in deterministic order arms.
               if (!episode.opened && !episode.fired && editSeen && wevibeAvailable && bindingState.active && !recallInFlight) {
                 episodeTracker.markFired(needSessionId, failureKey)
                 firedEpisodeBySession.set(needSessionId, { failureKey, episodeRef: episode.episodeRef })
-                triggerRecall(need.query, "repeat_failure")
+                funnelCounters.episodeArmed(needSessionId)
+                triggerRecall(needSessionId, need.query, "repeat_failure")
               }
             } else {
               // non-first failing ids: marked fired so they never fire later.
