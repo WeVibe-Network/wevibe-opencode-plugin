@@ -120,6 +120,66 @@ test('recordConfirmed accumulates confirmed_on_chain per session', () => {
   assert.equal(tracker.snapshot(sid)?.serve_sent, 0);
 });
 
+test('recordPredicate sets predicate_mode and dedups distinct_failure_keys', () => {
+  const tracker = new FunnelCountersTracker();
+  const sid = 'session-predicate';
+  assert.equal(tracker.snapshot(sid), undefined);
+
+  tracker.recordPredicate(sid, 'bench-fixture:v1', 'fail-key-A');
+  let snap = tracker.snapshot(sid)!;
+  assert.equal(snap.predicate_mode, 'bench-fixture:v1');
+  assert.equal(snap.distinct_failure_keys, 1);
+
+  // Same failureKey twice -> still one distinct key.
+  tracker.recordPredicate(sid, 'bench-fixture:v1', 'fail-key-A');
+  snap = tracker.snapshot(sid)!;
+  assert.equal(snap.predicate_mode, 'bench-fixture:v1');
+  assert.equal(snap.distinct_failure_keys, 1);
+
+  // A different failureKey -> two distinct keys.
+  tracker.recordPredicate(sid, 'bench-fixture:v1', 'fail-key-B');
+  snap = tracker.snapshot(sid)!;
+  assert.equal(snap.predicate_mode, 'bench-fixture:v1');
+  assert.equal(snap.distinct_failure_keys, 2);
+
+  // predicate_mode reflects the latest mode passed.
+  tracker.recordPredicate(sid, 'tripwire', 'fail-key-C');
+  snap = tracker.snapshot(sid)!;
+  assert.equal(snap.predicate_mode, 'tripwire');
+  assert.equal(snap.distinct_failure_keys, 3);
+});
+
+test('serveRejected increments serve_rejected; record(serve_sent) does not touch it', () => {
+  const tracker = new FunnelCountersTracker();
+  const sid = 'session-serve-reject';
+  assert.equal(tracker.snapshot(sid), undefined);
+
+  tracker.serveRejected(sid);
+  let snap = tracker.snapshot(sid)!;
+  assert.equal(snap.serve_rejected, 1);
+  assert.equal(snap.serve_sent, 0);
+
+  // A plain serve_sent increment does NOT change serve_rejected.
+  tracker.record(sid, 'serve_sent');
+  snap = tracker.snapshot(sid)!;
+  assert.equal(snap.serve_sent, 1);
+  assert.equal(snap.serve_rejected, 1);
+
+  tracker.serveRejected(sid);
+  snap = tracker.snapshot(sid)!;
+  assert.equal(snap.serve_rejected, 2);
+});
+
+test('fresh session defaults: predicate_mode "", distinct_failure_keys 0, serve_rejected 0', () => {
+  const tracker = new FunnelCountersTracker();
+  const sid = 'session-defaults';
+  tracker.episodeOpened(sid);
+  const snap = tracker.snapshot(sid)!;
+  assert.equal(snap.predicate_mode, '');
+  assert.equal(snap.distinct_failure_keys, 0);
+  assert.equal(snap.serve_rejected, 0);
+});
+
 // ---------------------------------------------------------------------------
 // Integration: real plugin hooks drive the episode seams + module read surface.
 // ---------------------------------------------------------------------------
@@ -347,6 +407,8 @@ test('serializeFunnelSnapshot returns flat sessionId->counters JSON object', () 
     tracker.gateDecided(sid);
     tracker.serveSent(sid);
     tracker.recordConfirmed(sid, 2);
+    tracker.recordPredicate(sid, 'bench-fixture:v1', 'fail-key-A');
+    tracker.serveRejected(sid);
 
     const json = JSON.parse(serializeFunnelSnapshot());
     assert.equal(typeof json, 'object');
@@ -357,6 +419,10 @@ test('serializeFunnelSnapshot returns flat sessionId->counters JSON object', () 
     assert.equal(json[sid].serve_sent, 1);
     assert.equal(json[sid].confirmed_on_chain, 2);
     assert.equal(json[sid].gate_decision_ms, null);
+    // The three observability-only fields flow through serialization.
+    assert.equal(json[sid].predicate_mode, 'bench-fixture:v1');
+    assert.equal(json[sid].distinct_failure_keys, 1);
+    assert.equal(json[sid].serve_rejected, 1);
   } finally {
     resetFunnelCountersTrackers();
   }

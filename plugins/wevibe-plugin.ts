@@ -2068,6 +2068,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           })
             .then(async (res) => {
               if (res.ok) return
+              funnelCounters.serveRejected(sid)
               let reason = ""
               try { reason = excerpt((await res.text()).slice(0, 512), 200) ?? "" } catch {
                 // best effort
@@ -2291,6 +2292,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         if (failingIds.length === 0) {
           // TRIPWIRE (unchanged): cmd fp predicate, failingTest null, ONE key.
           const failureKey = computeFailureKey({ repoBinding: bindingState.fingerprint ?? "", predicateId: tripwirePredicateId, failingTest: null, commandFp8 })
+          funnelCounters.recordPredicate(needSessionId, "tripwire", failureKey)
           const episode = episodeTracker.openOrTouch({ ...baseOpenInput, failureKey, predicateId: tripwirePredicateId, testId: null })
           enqueueHarvestedOutcomes(needSessionId, episode.expired)
           if (episode.opened) funnelCounters.episodeOpened(needSessionId)
@@ -2304,6 +2306,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
           const sortedIds = [...failingIds].sort()
           sortedIds.forEach((testId, index) => {
             const failureKey = computeFailureKey({ repoBinding: bindingState.fingerprint ?? "", predicateId, failingTest: testId, commandFp8 })
+            funnelCounters.recordPredicate(needSessionId, predicateId, failureKey)
             const episode = episodeTracker.openOrTouch({ ...baseOpenInput, failureKey, predicateId, testId })
             enqueueHarvestedOutcomes(needSessionId, episode.expired)
             if (episode.opened) funnelCounters.episodeOpened(needSessionId)

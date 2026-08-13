@@ -25,6 +25,12 @@ export interface FunnelCounters {
   confirmed_on_chain: number
   /** Wall-clock ms from gate shown to gate decided; null until endGate. */
   gate_decision_ms: number | null
+  /** Predicate mode in force for the session: the concrete adapter id (e.g. `"bench-fixture:v1"`) when a concrete adapter was matched/bound, else the constant `"tripwire"` when the tripwire fallback applied; `""` until the first predicate event of the session. */
+  predicate_mode: string
+  /** Count of distinct failureKeys opened/touched this session (same key twice = one). */
+  distinct_failure_keys: number
+  /** Count of serve POSTs rejected at MCP intake (non-2xx response, e.g. the 400 fail-closed rejection when a serve fires with no armed episode). Mutually consistent: serve_rejected ⊆ serve_sent; confirmed_on_chain is disjoint from a rejected serve. */
+  serve_rejected: number
 }
 
 const ZERO: FunnelCounters = {
@@ -36,11 +42,15 @@ const ZERO: FunnelCounters = {
   serve_sent: 0,
   confirmed_on_chain: 0,
   gate_decision_ms: null,
+  predicate_mode: "",
+  distinct_failure_keys: 0,
+  serve_rejected: 0,
 }
 
 export class FunnelCountersTracker {
   private readonly bySession = new Map<string, FunnelCounters>()
   private readonly gateStartAt = new Map<string, number>()
+  private readonly failureKeys = new Map<string, Set<string>>()
 
   private countersFor(sessionId: string): FunnelCounters {
     let counters = this.bySession.get(sessionId)
@@ -84,6 +94,22 @@ export class FunnelCountersTracker {
   recordConfirmed(sessionId: string, count: number): void {
     const counters = this.countersFor(sessionId)
     counters.confirmed_on_chain += count
+  }
+
+  /** Record the predicate mode in force and the failureKey opened/touched this trigger event. */
+  recordPredicate(sessionId: string, mode: string, failureKey: string): void {
+    const counters = this.countersFor(sessionId)
+    counters.predicate_mode = mode
+    let keys = this.failureKeys.get(sessionId)
+    if (!keys) { keys = new Set<string>(); this.failureKeys.set(sessionId, keys) }
+    keys.add(failureKey)
+    counters.distinct_failure_keys = keys.size
+  }
+
+  /** Increment the serve-rejected count (a serve POST that got a non-2xx from MCP intake). */
+  serveRejected(sessionId: string): void {
+    const counters = this.countersFor(sessionId)
+    counters.serve_rejected += 1
   }
 
   /** Stamp the gate-shown timestamp for a session. */

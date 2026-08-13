@@ -41,6 +41,7 @@ type SetupHarnessOptions = {
   recallResponder?: (call: FetchCall) => Response | Promise<Response>
   decisionNoteResponder?: (call: FetchCall) => Response | Promise<Response>
   confirmResponder?: (call: FetchCall) => Response | Promise<Response>
+  serveResponder?: (call: FetchCall) => Response | Promise<Response>
   captureLogFile?: boolean
   recallMode?: 'test' | 'prod'
   answererPolicy?: 'auto-accept' | 'auto-deny' | 'off'
@@ -189,6 +190,9 @@ const setupHarness = async (
       return toJsonResponse(200, { status: 'ok' });
     }
     if (url.endsWith('/v1/serves')) {
+      if (options.serveResponder) {
+        return options.serveResponder(call);
+      }
       return toJsonResponse(200, { status: 'ok' });
     }
     if (url.includes('/serves/confirm')) {
@@ -423,6 +427,14 @@ const serveBodies = (calls: FetchCall[]): Array<Record<string, unknown>> =>
   calls
     .filter(call => call.url.endsWith('/v1/serves'))
     .map(call => JSON.parse(call.bodyText ?? '{}') as Record<string, unknown>);
+
+const waitForServeRejected = async (sessionID: string, expected: number): Promise<void> => {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if ((snapshot(sessionID)?.serve_rejected ?? 0) >= expected) return;
+    await sleep(25);
+  }
+  throw new Error(`Timed out waiting for serve_rejected=${expected} on ${sessionID}`);
+};
 
 test('injects once per session, preserves stable position, avoids re-push, restores exact block on compacting, and serves once', { concurrency: false }, async (t) => {
   const memories: RecallMemory[] = [
@@ -1440,4 +1452,176 @@ test('source=user decisions land as user-verdict outcomes (accept=worked, deny=d
   assert.equal(acceptRec.resolution, 'worked');
   assert.ok(denyRec, 'expected a source=user deny outcome');
   assert.equal(denyRec.resolution, 'didnt_work');
+});
+
+// ---------------------------------------------------------------------------
+// Funnel observability wiring (WO-FUNNEL-DISC): serve rejection, predicate
+// mode, and distinct failure-key counters at the points where the modes are
+// already decided. Observability only — no trigger/tripwire/gate semantics.
+// ---------------------------------------------------------------------------
+
+test('serve rejected: a non-2xx serve POST increments serve_sent and serve_rejected, not confirmed_on_chain', { concurrency: false }, async (t) => {
+  resetFunnelCountersTrackers();
+  const harness = await setupHarness(
+    [{ cid: 'r1'.repeat(32), text: 'rejected memory' }],
+    { recall_max_injected: 10, inject_char_budget: 8000 },
+    { serveResponder: () => toJsonResponse(400, { error: 'no episode_ref' }) },
+  );
+  t.after(() => {
+    harness.cleanup();
+    resetFunnelCountersTrackers();
+  });
+
+  const { hooks, calls } = harness;
+  const sessionID = 'session-serve-rejected';
+
+  await driveRepeatFailure(hooks, calls, sessionID);
+  await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
+
+  const serves = serveBodies(calls);
+  assert.ok(serves.length >= 1, 'a serve must post');
+
+  // serve_sent is synchronous; serve_rejected lands in the async .then — poll.
+  await waitForServeRejected(sessionID, 1);
+  const snap = snapshot(sessionID);
+  assert.ok((snap?.serve_sent ?? 0) >= 1, 'serve_sent must be incremented');
+  assert.ok((snap?.serve_rejected ?? 0) >= 1, 'serve_rejected must be incremented on a non-2xx serve');
+  assert.equal(snap?.confirmed_on_chain, 0, 'confirmed_on_chain must NOT increment on a rejected serve');
+});
+
+test('serve ok: a 2xx serve POST increments serve_sent and leaves serve_rejected at its default', { concurrency: false }, async (t) => {
+  resetFunnelCountersTrackers();
+  const harness = await setupHarness(
+    [{ cid: 'ok1'.repeat(32), text: 'accepted memory' }],
+    { recall_max_injected: 10, inject_char_budget: 8000 },
+  );
+  t.after(() => {
+    harness.cleanup();
+    resetFunnelCountersTrackers();
+  });
+
+  const { hooks, calls } = harness;
+  const sessionID = 'session-serve-ok';
+
+  await driveRepeatFailure(hooks, calls, sessionID);
+  await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
+
+  const serves = serveBodies(calls);
+  assert.ok(serves.length >= 1, 'a serve must post');
+
+  const snap = snapshot(sessionID);
+  assert.ok((snap?.serve_sent ?? 0) >= 1, 'serve_sent must be incremented');
+  assert.equal(snap?.serve_rejected, 0, 'serve_rejected must stay at its default on a 2xx serve');
+  assert.equal(snap?.confirmed_on_chain, 0, 'confirmed_on_chain must stay 0 on a plain 2xx serve (no confirm receipt)');
+});
+
+test('predicate_mode records the concrete bench-fixture adapter id when it matches', { concurrency: false }, async (t) => {
+  clearPredicateCache();
+  const harness = await setupHarness([{ cid: 'pm1'.repeat(32), text: 'bench predicate memory' }], { recall_max_injected: 10, inject_char_budget: 8000 });
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls, appLogs, worktree } = harness;
+  const sessionID = 'session-predicate-bench';
+  const BENCH_CMD = 'npm run bench';
+  const FAILING_TEST = 'suite:file::TestA';
+
+  writeFileSync(
+    join(worktree, '.wevibe', 'predicate.json'),
+    JSON.stringify({ reporter: 'bench-fixture', command: BENCH_CMD }),
+    'utf8',
+  );
+
+  await waitForAppLog(appLogs, /\[binding\] session bind: active=true/);
+  await waitForAppLog(appLogs, /\[recall\] init wevibeAvailable=true/);
+
+  await hooks['tool.execute.after'](
+    { sessionID, callID: 'pm-bench-1', tool: 'bash', args: { command: BENCH_CMD } },
+    { title: '', output: `WEVIBE-BENCH-REPORT v1\n{"test":"${FAILING_TEST}","status":"fail"}\n`, metadata: { exit: 1 } },
+  );
+
+  assert.equal(snapshot(sessionID)?.predicate_mode, 'bench-fixture:v1', 'concrete bench-fixture adapter id must be recorded');
+});
+
+test('predicate_mode records tripwire when no concrete adapter matches', { concurrency: false }, async (t) => {
+  resetFunnelCountersTrackers();
+  const harness = await setupHarness([{ cid: 'pm2'.repeat(32), text: 'tripwire predicate memory' }], { recall_max_injected: 10, inject_char_budget: 8000 });
+  t.after(() => {
+    harness.cleanup();
+    resetFunnelCountersTrackers();
+  });
+
+  const { hooks, calls, appLogs } = harness;
+  const sessionID = 'session-predicate-tripwire';
+
+  await waitForAppLog(appLogs, /\[binding\] session bind: active=true/);
+  await waitForAppLog(appLogs, /\[recall\] init wevibeAvailable=true/);
+
+  await hooks['tool.execute.after'](redCall(sessionID, 'pm-trip-1'), failOutput());
+
+  assert.equal(snapshot(sessionID)?.predicate_mode, 'tripwire', 'tripwire fallback must be recorded');
+});
+
+test('distinct_failure_keys: the same failureKey across waves dedups to 1', { concurrency: false }, async (t) => {
+  const SINGLE_CMD = 'npm run singlefail';
+  const singleAdapter: PredicateAdapter = {
+    predicateId: 'singlefail:unit',
+    matches: (ctx: PredicateRunContext): boolean => ctx.command === SINGLE_CMD,
+    extractFailingTestIds: (): string[] => ['pkg/only.test.ts'],
+    extractPassingTestIds: (): string[] => [],
+  };
+  registerPredicateAdapter(singleAdapter);
+
+  const harness = await setupHarness([{ cid: 'd0'.repeat(32), text: 'distinct key memory' }], { recall_max_injected: 10, inject_char_budget: 8000 });
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls, appLogs } = harness;
+  const sessionID = 'session-distinct-same';
+
+  await waitForAppLog(appLogs, /\[binding\] session bind: active=true/);
+  await waitForAppLog(appLogs, /\[recall\] init wevibeAvailable=true/);
+
+  const red = (callID: string): Record<string, unknown> => ({
+    sessionID,
+    callID,
+    tool: 'bash',
+    args: { command: SINGLE_CMD },
+  });
+  const fail = (): Record<string, unknown> => ({ title: '', output: 'failing tests', metadata: { exit: 1 } });
+
+  // Same single failing id across two waves → same failureKey → 1 distinct.
+  await hooks['tool.execute.after'](red('df-1'), fail());
+  await hooks['tool.execute.after'](red('df-2'), fail());
+  assert.equal(snapshot(sessionID)?.distinct_failure_keys, 1, 'same failureKey must dedup to 1');
+});
+
+test('distinct_failure_keys: two distinct failing ids in one wave count 2', { concurrency: false }, async (t) => {
+  const DUAL_CMD = 'npm run dualfail';
+  const dualAdapter: PredicateAdapter = {
+    predicateId: 'dualfail:unit',
+    matches: (ctx: PredicateRunContext): boolean => ctx.command === DUAL_CMD,
+    extractFailingTestIds: (): string[] => ['pkg/x.test.ts', 'pkg/y.test.ts'],
+    extractPassingTestIds: (): string[] => [],
+  };
+  registerPredicateAdapter(dualAdapter);
+
+  const harness = await setupHarness([{ cid: 'd1'.repeat(32), text: 'distinct key memory' }], { recall_max_injected: 10, inject_char_budget: 8000 });
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls, appLogs } = harness;
+  const sessionID = 'session-distinct-dual';
+
+  await waitForAppLog(appLogs, /\[binding\] session bind: active=true/);
+  await waitForAppLog(appLogs, /\[recall\] init wevibeAvailable=true/);
+
+  const red = (callID: string): Record<string, unknown> => ({
+    sessionID,
+    callID,
+    tool: 'bash',
+    args: { command: DUAL_CMD },
+  });
+  const fail = (): Record<string, unknown> => ({ title: '', output: 'failing tests', metadata: { exit: 1 } });
+
+  // Two distinct failing ids in one wave → 2 distinct keys.
+  await hooks['tool.execute.after'](red('df-3'), fail());
+  assert.equal(snapshot(sessionID)?.distinct_failure_keys, 2, 'two distinct failing ids must count 2');
 });
