@@ -1280,14 +1280,12 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       const env = {
         ...process.env,
         WEVIBE_HUB_URL: process.env.WEVIBE_HUB_URL ?? "http://localhost:4440",
-        // The spawned MCP performs leader-side Umbral crypto (org-setup epoch-keypair
-        // derivation, kfrag minting, recall decrypt-reencrypted) and guard scanning.
-        // Those shell out to native binaries via WEVIBE_UMBRAL_SIDECAR_BIN / WEVIBE_GUARD_BIN.
-        // opencode's own env does NOT carry these, and the opencode.json mcp.env block does
-        // not apply to a plugin spawn() — so resolve them from wevibeRoot here, or the MCP
-        // throws "failed to derive epoch Umbral public key locally" on org creation.
-        WEVIBE_UMBRAL_SIDECAR_BIN:
-          process.env.WEVIBE_UMBRAL_SIDECAR_BIN ?? join(wevibeRoot, "wevibe-umbral/target/release/wevibe-umbral"),
+        // Leader-side Umbral crypto (epoch-keypair derivation, kfrag minting,
+        // recall decrypt-reencrypted) now runs in-process from WASM shipped
+        // inside wevibe-mcp, so no Umbral binary path is injected here any more.
+        // Guard scanning still shells out to a native binary: opencode's own env
+        // does NOT carry it, and the opencode.json mcp.env block does not apply
+        // to a plugin spawn(), so it is resolved from wevibeRoot here.
         WEVIBE_GUARD_BIN:
           process.env.WEVIBE_GUARD_BIN ?? join(wevibeRoot, "wevibe-guard/target/release/wevibe-guard"),
         WEVIBE_AUTO_CONTRIBUTE: "1",

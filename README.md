@@ -48,7 +48,9 @@ Supported flags:
 
 `install-opencode` writes `mcp.wevibe` with `enabled: false` on purpose.
 
-Reason: the engine plugin is the **sole** `:4450` MCP spawner because it provides the correct `WEVIBE_UMBRAL_SIDECAR_BIN` and `WEVIBE_GUARD_BIN` environment. A second opencode-spawned env-less MCP process would break leader-side Umbral crypto.
+Reason: the engine plugin is the **sole** `:4450` MCP spawner because it provides the correct `WEVIBE_GUARD_BIN` environment, and because two processes must not contend for the same port.
+
+Note: this is no longer an Umbral concern. Umbral crypto ships as WASM inside `wevibe-mcp` and works in any process regardless of environment, so an opencode-spawned MCP no longer breaks leader-side crypto — it would only collide on the port.
 
 ## Configuration
 
