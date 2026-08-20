@@ -195,6 +195,9 @@ const setupHarness = async (
       }
       return toJsonResponse(200, { status: 'ok' });
     }
+    if (url.endsWith('/v1/denials')) {
+      return toJsonResponse(200, { status: 'ok' });
+    }
     if (url.includes('/serves/confirm')) {
       if (options.confirmResponder) {
         return options.confirmResponder(call);
@@ -426,6 +429,11 @@ const readStatus = (harness: Harness): unknown => JSON.parse(readFileSync(harnes
 const serveBodies = (calls: FetchCall[]): Array<Record<string, unknown>> =>
   calls
     .filter(call => call.url.endsWith('/v1/serves'))
+    .map(call => JSON.parse(call.bodyText ?? '{}') as Record<string, unknown>);
+
+const denialBodies = (calls: FetchCall[]): Array<Record<string, unknown>> =>
+  calls
+    .filter(call => call.url.endsWith('/v1/denials'))
     .map(call => JSON.parse(call.bodyText ?? '{}') as Record<string, unknown>);
 
 const waitForServeRejected = async (sessionID: string, expected: number): Promise<void> => {
@@ -1185,6 +1193,56 @@ test('serve POST without a firing episode omits episode_ref and does not break t
   // The transform completed without throwing and injected the memory (tripwire fallback intact).
   assert.equal(output.system.length, 2);
   assert.ok(output.system[1].includes('## Team Memory (WeVibe Network)'));
+});
+
+test('denial POST carries the originating serve firing episode episode_ref when a fired episode exists for the session', { concurrency: false }, async (t) => {
+  const harness = await setupHarness([], { recall_max_injected: 10, inject_char_budget: 8000 });
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls } = harness;
+  const sessionID = 'session-denial-episode-ref';
+  const COMMAND = 'npm run build';
+
+  // Arms + fires a TRIPWIRE episode under sessionID: firedEpisodeBySession gains
+  // an entry keyed by sessionID (mirrors the serve episode_ref test setup).
+  await driveRepeatFailure(hooks, calls, sessionID);
+
+  // A block decision drains on the next transform -> submitDenial posts /v1/denials.
+  writeDecisions(harness, [{ memoryID: 'cid-block-1', action: 'block', reason: 'bad memory', timestamp: Date.now() }]);
+  await hooks['experimental.chat.system.transform']({ sessionID }, { system: ['base system'] });
+
+  const denials = denialBodies(calls);
+  assert.equal(denials.length, 1);
+  assert.equal(denials[0].org_id, 'org-test');
+  assert.equal(denials[0].memory_hash, 'cid-block-1');
+
+  // The denial body carries the SAME episode_ref the tracker computed for
+  // (org, session, failureKey) — the originating serve's firing episode.
+  const commandFp8Val = fp8(COMMAND);
+  const repoBinding = 'a'.repeat(64);
+  const tripwireKey = computeFailureKey({ repoBinding, predicateId: `cmd:${commandFp8Val}`, failingTest: null, commandFp8: commandFp8Val });
+  const expectedRef = computeEpisodeRef('org-test', sessionID, tripwireKey);
+  assert.equal(denials[0].episode_ref, expectedRef, 'denial episode_ref must equal the fired episode episodeRef');
+});
+
+test('denial POST omits episode_ref when no fired episode exists for the current session', { concurrency: false }, async (t) => {
+  const harness = await setupHarness([], { recall_max_injected: 10, inject_char_budget: 8000 });
+  t.after(() => harness.cleanup());
+
+  const { hooks, calls } = harness;
+  const armingSession = 'session-arms-episode-for-denial';
+  const denyingSession = 'session-denies-without-episode';
+
+  // Arm an episode under `armingSession` so firedEpisodeBySession has an entry —
+  // just not for the session that files the denial.
+  await driveRepeatFailure(hooks, calls, armingSession);
+
+  writeDecisions(harness, [{ memoryID: 'cid-block-2', action: 'block', timestamp: Date.now() }]);
+  await hooks['experimental.chat.system.transform']({ sessionID: denyingSession }, { system: ['base system'] });
+
+  const denials = denialBodies(calls);
+  assert.equal(denials.length, 1);
+  assert.equal(denials[0].episode_ref, undefined, 'unpaired denial must omit episode_ref (fail-closed, intentionally unpaired)');
 });
 
 // ---------------------------------------------------------------------------

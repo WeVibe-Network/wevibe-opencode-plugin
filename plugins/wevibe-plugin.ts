@@ -1067,6 +1067,7 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
       return
     }
 
+    const firedEpisode = firedEpisodeBySession.get(currentSessionId())
     const response = await fetch(`${WEVIBE_MCP_HTTP}/v1/denials`, {
       method: "POST",
       headers: {
@@ -1077,6 +1078,10 @@ export const WeVibeMemoryPlugin: Plugin = async ({ directory, worktree, client, 
         org_id: organizationId,
         memory_hash: decision.memoryID,
         reason: decision.reason ?? "",
+        // D-RECALL-PAIRING-TOKEN: pair this denial with the ORIGINATING serve's
+        // firing episode, mirroring the serve POST. Fail-closed: an unpaired
+        // denial (no fired episode for this session) omits episode_ref.
+        ...(firedEpisode?.episodeRef ? { episode_ref: firedEpisode.episodeRef } : {}),
       }),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     })
