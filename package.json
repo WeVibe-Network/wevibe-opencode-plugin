@@ -25,15 +25,15 @@
     "uninstall-opencode": "tsx bin/install-opencode.ts uninstall-opencode"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "1.4.10",
-    "@opencode-ai/sdk": "1.4.10"
+    "@opencode-ai/plugin": "1.18.25",
+    "@opencode-ai/sdk": "1.18.25"
   },
   "devDependencies": {
-    "@opentui/core": "0.4.1",
-    "@opentui/solid": "0.4.1",
-    "@types/node": "22.19.21",
-    "solid-js": "1.9.13",
-    "tsx": "^4.19.2",
-    "typescript": "6.0.3"
+    "@opentui/core": "0.5.9",
+    "@opentui/solid": "0.5.9",
+    "@types/node": "26.4.0",
+    "solid-js": "1.9.15",
+    "tsx": "^4.23.12",
+    "typescript": "7.0.2"
   }
 }
